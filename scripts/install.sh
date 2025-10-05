@@ -489,7 +489,7 @@ cat > "$WORKFLOW_PATH/Contents/document.wflow" << EOF
                     <key>COMMAND_STRING</key>
                     <string>for f in "\$@"
 do
-    "$BIN_DIR/transcribe.sh" "\$f" &amp;
+    "$HOME/Library/Application Support/Transcribe/bin/transcribe.sh" "\$f" &amp;
 done</string>
                     <key>CheckedForUserDefaultShell</key>
                     <true/>
