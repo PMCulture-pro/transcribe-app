@@ -1,0 +1,49 @@
+# Временные файлы
+*.tmp
+*.log
+.DS_Store
+*~
+
+# Аудио/видео файлы (не загружать в репозиторий - слишком большие)
+audio/
+samples/
+*.mov
+*.mp4
+*.avi
+*.mkv
+*.mp3
+*.wav
+*.m4a
+*.flac
+
+# Транскрибированные текстовые файлы
+text/
+*.txt
+
+# AI модели (слишком большие для GitHub - до 3 GB)
+models/
+*.bin
+*.pt
+*.onnx
+
+# Кэш и временные директории
+__pycache__/
+.cache/
+.pytest_cache/
+*.pyc
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+
+# Homebrew
+Brewfile.lock.json
+
