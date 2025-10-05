@@ -25,6 +25,10 @@ MODEL_SIZE="3.0 GB"
 FFMPEG_SIZE="95 MB"
 TOTAL_SIZE="3.1 GB"
 
+# SHA256 контрольная сумма модели для проверки целостности
+# Источник: https://huggingface.co/ggerganov/whisper.cpp
+EXPECTED_MODEL_SHA256="64d1bcefa5d7be7933b8123f90276dbce26e1fcefdbb6ef4da7e61b58e14956d"
+
 echo -e "${BLUE}╔═══════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║                                                   ║${NC}"
 echo -e "${BLUE}║        🎙️  Transcribe App Installer 🎙️           ║${NC}"
@@ -82,15 +86,58 @@ echo ""
 # Проверка и установка Homebrew
 echo -e "${BLUE}[2/5]${NC} Проверка Homebrew..."
 if ! command -v brew &> /dev/null; then
-    echo -e "${YELLOW}⚠ Homebrew не найден. Устанавливаю Homebrew...${NC}"
-    /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+    echo -e "${YELLOW}⚠ Homebrew не найден.${NC}"
+    echo ""
+    echo "Для установки Transcribe App требуется Homebrew."
+    echo ""
+    echo "Вариант 1 (Рекомендуется): Установите Homebrew вручную"
+    echo "  1. Откройте: https://brew.sh"
+    echo "  2. Следуйте официальным инструкциям"
+    echo "  3. Запустите этот скрипт снова"
+    echo ""
+    echo "Вариант 2: Автоматическая установка (требует подтверждения)"
+    read -p "Установить Homebrew автоматически? (y/n): " -n 1 -r
+    echo
     
-    # Добавляем Homebrew в PATH для Apple Silicon
-    if [[ $(uname -m) == 'arm64' ]]; then
-        echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
-        eval "$(/opt/homebrew/bin/brew shellenv)"
+    if [[ $REPLY =~ ^[YyДд]$ ]]; then
+        echo "Устанавливаю Homebrew..."
+        echo ""
+        
+        # Скачиваем скрипт установки во временный файл
+        BREW_INSTALL_SCRIPT="/tmp/brew_install_$$.sh"
+        curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh -o "$BREW_INSTALL_SCRIPT"
+        
+        # Показываем первые строки скрипта для проверки
+        echo "Первые 10 строк скрипта установки Homebrew:"
+        echo "---"
+        head -10 "$BREW_INSTALL_SCRIPT"
+        echo "---"
+        echo ""
+        read -p "Продолжить установку? (y/n): " -n 1 -r
+        echo
+        
+        if [[ $REPLY =~ ^[YyДд]$ ]]; then
+            /bin/bash "$BREW_INSTALL_SCRIPT"
+            rm -f "$BREW_INSTALL_SCRIPT"
+            
+            # Добавляем Homebrew в PATH для Apple Silicon
+            if [[ $(uname -m) == 'arm64' ]]; then
+                # Проверяем что строка еще не добавлена
+                if ! grep -q "/opt/homebrew/bin/brew shellenv" ~/.zprofile 2>/dev/null; then
+                    echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> ~/.zprofile
+                fi
+                eval "$(/opt/homebrew/bin/brew shellenv)"
+            fi
+            echo -e "${GREEN}✓ Homebrew установлен${NC}"
+        else
+            echo -e "${RED}Установка отменена. Установите Homebrew вручную и запустите скрипт снова.${NC}"
+            rm -f "$BREW_INSTALL_SCRIPT"
+            exit 1
+        fi
+    else
+        echo -e "${RED}Установка отменена. Установите Homebrew вручную и запустите скрипт снова.${NC}"
+        exit 1
     fi
-    echo -e "${GREEN}✓ Homebrew установлен${NC}"
 else
     echo -e "${GREEN}✓ Homebrew уже установлен${NC}"
 fi
@@ -139,6 +186,31 @@ else
     fi
     
     echo -e "${GREEN}✓ Модель успешно скачана${NC}"
+    echo ""
+    
+    # Проверка целостности модели
+    echo "  Проверка целостности модели..."
+    if command -v shasum &> /dev/null; then
+        ACTUAL_SHA256=$(shasum -a 256 "$MODEL_PATH" | cut -d' ' -f1)
+    elif command -v sha256sum &> /dev/null; then
+        ACTUAL_SHA256=$(sha256sum "$MODEL_PATH" | cut -d' ' -f1)
+    else
+        echo -e "${YELLOW}⚠ Предупреждение: shasum не найден, пропускаю проверку целостности${NC}"
+        ACTUAL_SHA256=""
+    fi
+    
+    if [ -n "$ACTUAL_SHA256" ]; then
+        if [ "$ACTUAL_SHA256" = "$EXPECTED_MODEL_SHA256" ]; then
+            echo -e "${GREEN}✓ Контрольная сумма совпадает (модель подлинная)${NC}"
+        else
+            echo -e "${RED}✗ ОШИБКА: Контрольная сумма не совпадает!${NC}"
+            echo -e "${RED}  Ожидалось: $EXPECTED_MODEL_SHA256${NC}"
+            echo -e "${RED}  Получено:  $ACTUAL_SHA256${NC}"
+            echo -e "${RED}  Модель может быть повреждена или подменена.${NC}"
+            rm -f "$MODEL_PATH"
+            exit 1
+        fi
+    fi
 fi
 echo ""
 

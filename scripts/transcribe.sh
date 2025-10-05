@@ -40,7 +40,7 @@ TEMP_OUTPUT=$(mktemp)
 
 # Запускаем whisper-cpp с подавлением вывода текста
 /opt/homebrew/Cellar/whisper-cpp/1.8.0/libexec/bin/whisper-cli \
-    -m ~/.cache/whisper/ggml-large-v3.bin \
+    -m "$HOME/.cache/whisper/ggml-large-v3.bin" \
     -f "$INPUT_AUDIO" \
     -l ru \
     --print-progress \
