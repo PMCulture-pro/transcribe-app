@@ -40,7 +40,7 @@ If you discover a security vulnerability in Transcribe App, please report it res
 ### How to Report
 
 1. **DO NOT** open a public GitHub issue for security vulnerabilities
-2. Send an email to: [YOUR_EMAIL@example.com]
+2. Send an email to: **sd.reg01@bk.ru**
 3. Include:
    - Description of the vulnerability
    - Steps to reproduce
@@ -117,7 +117,7 @@ If you discover a security vulnerability in Transcribe App, please report it res
 ## Contact
 
 For security concerns:
-- Email: [YOUR_EMAIL@example.com]
+- Email: **sd.reg01@bk.ru**
 - GitHub Security Advisories: https://github.com/PMCulture-pro/transcribe-app/security/advisories
 
 For general questions:
