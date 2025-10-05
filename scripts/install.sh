@@ -12,6 +12,57 @@ YELLOW='\033[1;33m'
 RED='\033[0;31m'
 NC='\033[0m' # No Color
 
+# Вспомогательные функции прогресса
+SPINNER_CHARS='|/-\\'
+HEARTBEAT_PID=""
+LOG_FOLLOW_PID=""
+
+stop_background_progress() {
+    if [ -n "$HEARTBEAT_PID" ] && kill -0 "$HEARTBEAT_PID" 2>/dev/null; then
+        kill "$HEARTBEAT_PID" 2>/dev/null || true
+        wait "$HEARTBEAT_PID" 2>/dev/null || true
+        HEARTBEAT_PID=""
+    fi
+    if [ -n "$LOG_FOLLOW_PID" ] && kill -0 "$LOG_FOLLOW_PID" 2>/dev/null; then
+        kill "$LOG_FOLLOW_PID" 2>/dev/null || true
+        wait "$LOG_FOLLOW_PID" 2>/dev/null || true
+        LOG_FOLLOW_PID=""
+    fi
+}
+
+trap stop_background_progress EXIT INT TERM
+
+start_log_follow() {
+    # Показываем только релевантные строки про CLT/softwareupdate
+    # Без блокировки — будет убито по завершению
+    if command -v sudo >/dev/null 2>&1; then
+        sudo -n true 2>/dev/null || true
+        sudo tail -n0 -F /var/log/install.log 2>/dev/null | \
+        grep --line-buffered -E "Command Line Tools|softwareupdate|CLTools|Installing|Downloaded|Verifying" &
+        LOG_FOLLOW_PID=$!
+    else
+        tail -n0 -F /var/log/install.log 2>/dev/null | \
+        grep --line-buffered -E "Command Line Tools|softwareupdate|CLTools|Installing|Downloaded|Verifying" &
+        LOG_FOLLOW_PID=$!
+    fi
+}
+
+start_heartbeat() {
+    local title="$1"
+    (
+        local i=0
+        local start_ts=$(date +%s)
+        while true; do
+            i=$(((i+1)%4))
+            local now=$(date +%s)
+            local elapsed=$((now-start_ts))
+            printf "\r%s %s  ⏳ %02d:%02d:%02d" "$title" "${SPINNER_CHARS:$i:1}" $((elapsed/3600)) $(((elapsed/60)%60)) $((elapsed%60))
+            sleep 1
+        done
+    ) &
+    HEARTBEAT_PID=$!
+}
+
 # Директории установки
 INSTALL_DIR="$HOME/Library/Application Support/Transcribe"
 BIN_DIR="$INSTALL_DIR/bin"
@@ -117,7 +168,21 @@ if ! command -v brew &> /dev/null; then
         echo
         
         if [[ $REPLY =~ ^[YyДд]$ ]]; then
-            /bin/bash "$BREW_INSTALL_SCRIPT"
+            echo "Запускаю установку Homebrew. Это может установить Xcode Command Line Tools."
+            echo "Показываю живой лог softwareupdate и индикатор времени..."
+            start_log_follow
+            start_heartbeat "  Установка Homebrew/CLT идёт"
+
+            # Запускаем скрипт установки в фоне, чтобы параллельно показывать прогресс
+            (
+                /bin/bash "$BREW_INSTALL_SCRIPT"
+            ) &
+            BREW_BOOTSTRAP_PID=$!
+            wait "$BREW_BOOTSTRAP_PID"
+
+            # Очищаем прогресс-индикаторы
+            stop_background_progress
+            echo -e "\r${GREEN}✓ Установка Homebrew завершена${NC}                               "
             rm -f "$BREW_INSTALL_SCRIPT"
             
             # Добавляем Homebrew в PATH для Apple Silicon
@@ -146,16 +211,16 @@ echo ""
 # Установка whisper-cpp и ffmpeg через Homebrew
 echo -e "${BLUE}[3/5]${NC} Установка whisper-cpp и ffmpeg..."
 if ! brew list whisper-cpp &> /dev/null; then
-    echo "  Устанавливаю whisper-cpp..."
-    brew install whisper-cpp
+    echo "  Устанавливаю whisper-cpp (verbose)..."
+    brew install -v whisper-cpp
     echo -e "${GREEN}✓ whisper-cpp установлен${NC}"
 else
     echo -e "${GREEN}✓ whisper-cpp уже установлен${NC}"
 fi
 
 if ! command -v ffmpeg &> /dev/null; then
-    echo "  Устанавливаю ffmpeg..."
-    brew install ffmpeg
+    echo "  Устанавливаю ffmpeg (verbose)..."
+    brew install -v ffmpeg
     echo -e "${GREEN}✓ ffmpeg установлен${NC}"
 else
     echo -e "${GREEN}✓ ffmpeg уже установлен${NC}"
