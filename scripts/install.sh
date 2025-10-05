@@ -27,7 +27,7 @@ TOTAL_SIZE="3.1 GB"
 
 # SHA256 контрольная сумма модели для проверки целостности
 # Источник: https://huggingface.co/ggerganov/whisper.cpp
-EXPECTED_MODEL_SHA256="64d1bcefa5d7be7933b8123f90276dbce26e1fcefdbb6ef4da7e61b58e14956d"
+EXPECTED_MODEL_SHA256="64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2"
 
 echo -e "${BLUE}╔═══════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║                                                   ║${NC}"
