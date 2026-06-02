@@ -137,7 +137,7 @@ brew list ffmpeg &> /dev/null && echo "Еще установлен" || echo "У�
 
 ```bash
 # Скачать и запустить установщик
-bash <(curl -fsSL https://your-url/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/PMCulture-pro/transcribe-app/main/scripts/install.sh)
 
 # Или если у вас есть локальная копия
 bash ~/Downloads/install.sh
