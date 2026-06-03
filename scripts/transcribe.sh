@@ -131,7 +131,7 @@ notify "Transcribe" "Начинаю: $INPUT_NAME — примерно $EST_FMT" 
 "$WHISPER_BIN" \
     -m "$MODEL_PATH" \
     -f "$TEMP_AUDIO" \
-    -l ru \
+    -l auto \
     --print-progress \
     --output-txt \
     --output-file "$TEMP_OUTPUT" 2>&1 | {
