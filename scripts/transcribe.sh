@@ -180,8 +180,13 @@ if [ "$USE_TIMESTAMPS" = "1" ] || [ "$USE_READABLE" = "1" ]; then
     TS_ARGS=(--output-srt)
 fi
 
+# caffeinate -i не даёт системе уснуть в простое во время распознавания: иначе
+# на длинной записи сон приостанавливает процесс и ломает замер времени.
+CAFFEINATE=()
+command -v caffeinate >/dev/null 2>&1 && CAFFEINATE=(caffeinate -i)
+
 # --- Транскрибация с пингами прогресса ---------------------------------------
-"$WHISPER_BIN" \
+"${CAFFEINATE[@]}" "$WHISPER_BIN" \
     -m "$MODEL_PATH" \
     -f "$TEMP_AUDIO" \
     -l "$LANG_CODE" \
@@ -333,12 +338,17 @@ rm -f "$PROGRESS_TXT" 2>/dev/null || true
 
 # --- Обновляем оценку скорости (только для файлов от 60 c) --------------------
 if [ "$DUR_INT" -ge 60 ] && [ "$ELAPSED" -gt 0 ]; then
-    NEWF=$(awk -v d="$DUR_INT" -v e="$ELAPSED" 'BEGIN{printf "%.3f", d/e}')
-    if [ -f "$STATE_FILE" ]; then
-        OLD=$(cat "$STATE_FILE" 2>/dev/null)
-        NEWF=$(awk -v o="$OLD" -v n="$NEWF" 'BEGIN{ if(o+0<=0){print n} else {printf "%.3f", 0.5*o+0.5*n} }')
+    RAW=$(awk -v d="$DUR_INT" -v e="$ELAPSED" 'BEGIN{printf "%.3f", d/e}')
+    OLD=""
+    [ -f "$STATE_FILE" ] && OLD=$(cat "$STATE_FILE" 2>/dev/null)
+    if [ -n "$OLD" ] && awk -v o="$OLD" -v r="$RAW" 'BEGIN{exit !(o+0>0 && r+0>0 && r < o/3)}'; then
+        : # Аномально медленный замер (в 3+ раза ниже выученного) — почти наверняка
+          # сон/прерывание во время распознавания. Не обновляем, чтобы не испортить оценку.
+    elif [ -n "$OLD" ] && awk -v o="$OLD" 'BEGIN{exit !(o+0>0)}'; then
+        awk -v o="$OLD" -v n="$RAW" 'BEGIN{printf "%.3f", 0.5*o+0.5*n}' > "$STATE_FILE" 2>/dev/null || true
+    else
+        echo "$RAW" > "$STATE_FILE" 2>/dev/null || true
     fi
-    echo "$NEWF" > "$STATE_FILE" 2>/dev/null || true
 fi
 
 notify "Готово ✅" "Готово за ${ELAPSED_FMT}: ${OUTPUT_NAME}" "Glass"
