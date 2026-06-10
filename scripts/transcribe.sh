@@ -155,10 +155,14 @@ FINISH_HUMAN=$(date -r $((START_EPOCH + EST_SECS)) '+%Y-%m-%d %H:%M:%S')
 notify "Transcribe" "Начинаю: $INPUT_NAME — примерно $EST_FMT" "Glass"
 
 # --- Сборка аргументов whisper -----------------------------------------------
+# --max-context 0: НЕ переносить предыдущий текст между сегментами. Conditioning
+# на прошлый текст вызывает самоподдерживающиеся петли-галлюцинации на длинных
+# записях (одна фраза повторяется десятки раз и затирает реальную речь). Связность
+# терминов чуть ниже, но это несопоставимо с потерей куска расшифровки.
 case "$QUALITY" in
-    max)  QUALITY_ARGS=(--beam-size 8 --best-of 8 --entropy-thold 2.4 --max-context 64) ;;
-    fast) QUALITY_ARGS=(--beam-size 1 --best-of 1) ;;
-    *)    QUALITY_ARGS=(--beam-size 5 --best-of 5 --entropy-thold 2.4 --max-context 64) ;;  # balanced
+    max)  QUALITY_ARGS=(--beam-size 8 --best-of 8 --entropy-thold 2.4 --max-context 0) ;;
+    fast) QUALITY_ARGS=(--beam-size 1 --best-of 1 --max-context 0) ;;
+    *)    QUALITY_ARGS=(--beam-size 5 --best-of 5 --entropy-thold 2.4 --max-context 0) ;;  # balanced
 esac
 
 VAD_ARGS=()
@@ -251,6 +255,14 @@ for block in re.split(r"\r?\n\r?\n", content):
     if text:
         cues.append((tosec(a.strip().split()[0]), a.strip()[:8], tosec(b.strip().split()[0]), text))
 
+# Страховка от петель-галлюцинаций: схлопываем подряд идущие идентичные реплики.
+deduped = []
+for c in cues:
+    if deduped and deduped[-1][3].strip().lower() == c[3].strip().lower():
+        continue
+    deduped.append(c)
+cues = deduped
+
 # Группируем в абзацы: пауза между репликами > gap → новый абзац.
 paras, cur, cur_ts, prev_end = [], [], None, None
 for s, label, e, text in cues:
@@ -285,12 +297,14 @@ build_body() {
     fi
     # FEAT-1: только таймкоды — строки «[ЧЧ:ММ:СС] текст».
     if [ "$USE_TIMESTAMPS" = "1" ] && [ -f "$SRT" ]; then
+        # prev — страховка от петель: подряд идущие идентичные реплики не дублируем.
         awk '
+            function emit() { if (ts!="" && text!=prev) { print "[" ts "] " text; prev=text } ts=""; text="" }
             /-->/               { split($1, t, ","); ts=t[1]; text=""; next }
             /^[0-9]+\r?$/        { next }
-            /^[[:space:]]*\r?$/  { if (ts!="") { print "[" ts "] " text; ts=""; text="" } next }
+            /^[[:space:]]*\r?$/  { emit(); next }
                                 { sub(/\r$/,""); text=(text=="" ? $0 : text " " $0) }
-            END                 { if (ts!="") print "[" ts "] " text }
+            END                 { emit() }
         ' "$SRT" > "$TRANSCRIPT_BODY"
         return
     fi
