@@ -48,8 +48,11 @@ fi
 
 INPUT_DIR=$(dirname "$INPUT_FILE")
 INPUT_NAME=$(basename "$INPUT_FILE")
-INPUT_BASE="${INPUT_NAME%.*}"
-OUTPUT_TXT="$INPUT_DIR/${INPUT_BASE}.txt"
+# Расширение входит в имя результата (meeting.mp4 → meeting.mp4.txt): иначе
+# meeting.mp3 и meeting.mp4 дали бы один meeting.txt (второй затёр бы первый),
+# и легко затереть заметки пользователя meeting.txt. См. BACKLOG BUG-1.
+OUTPUT_NAME="${INPUT_NAME}.txt"
+OUTPUT_TXT="$INPUT_DIR/${OUTPUT_NAME}"
 PROGRESS_TXT="$INPUT_DIR/${INPUT_NAME}.InProgress.txt"
 
 # --- Поиск модели (переиспользуем уже скачанную) -----------------------------
@@ -99,6 +102,13 @@ DURATION=$("$FFPROBE_BIN" -v quiet -show_entries format=duration -of csv=p=0 "$T
 DUR_INT=${DURATION%.*}; DUR_INT=${DUR_INT:-0}
 DURATION_FMT=$(fmt_hms "$DUR_INT")
 
+# Видео без аудиодорожки / пустой звук → whisper галлюцинирует выдуманный текст.
+# Существование WAV ещё не значит, что в нём есть звук. См. BACKLOG BUG-2.
+if [ ! -s "$TEMP_AUDIO" ] || [ "$DUR_INT" -lt 1 ]; then
+    notify "Ошибка транскрибации" "В «$INPUT_NAME» нет звука (пустая или отсутствующая аудиодорожка)" "Basso"
+    exit 1
+fi
+
 # --- Оценка времени (самообучающийся множитель скорости) ---------------------
 FACTOR="$SEED_FACTOR"
 if [ -f "$STATE_FILE" ]; then
@@ -122,7 +132,7 @@ FINISH_HUMAN=$(date -r $((START_EPOCH + EST_SECS)) '+%Y-%m-%d %H:%M:%S')
     echo "Примерное время завершения транскрибации: $FINISH_HUMAN"
     echo ""
     echo "Идёт распознавание…"
-    echo "Когда закончится, рядом появится файл «${INPUT_BASE}.txt», а этот файл исчезнет."
+    echo "Когда закончится, рядом появится файл «${OUTPUT_NAME}», а этот файл исчезнет."
 } > "$PROGRESS_TXT" 2>/dev/null
 
 notify "Transcribe" "Начинаю: $INPUT_NAME — примерно $EST_FMT" "Glass"
@@ -192,5 +202,5 @@ if [ "$DUR_INT" -ge 60 ] && [ "$ELAPSED" -gt 0 ]; then
     echo "$NEWF" > "$STATE_FILE" 2>/dev/null || true
 fi
 
-notify "Готово ✅" "Готово за ${ELAPSED_FMT}: ${INPUT_BASE}.txt" "Glass"
+notify "Готово ✅" "Готово за ${ELAPSED_FMT}: ${OUTPUT_NAME}" "Glass"
 exit 0
