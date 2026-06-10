@@ -73,6 +73,8 @@ SERVICES_DIR="$HOME/Library/Services"
 
 # URLs для загрузки
 WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
+# VAD-модель Silero для RU-3 (несколько МБ) — против галлюцинаций в паузах.
+VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 # Канонический transcribe.sh — единый источник правды. Установщик копирует
 # соседний файл при запуске из клона репозитория, иначе докачивает по этому URL.
 TRANSCRIBE_RAW_URL="https://raw.githubusercontent.com/277zdwvw9f-pixel/transcribe-app/main/scripts/transcribe.sh"
@@ -262,16 +264,14 @@ else
     echo ""
 
     # Докачка (resume): обрыв сети не заставит качать 3 ГБ заново. INS-1.
-    if command -v wget &> /dev/null; then
-        wget -c --progress=bar:force -O "$MODEL_PATH" "$WHISPER_MODEL_URL" 2>&1 | \
-            grep --line-buffered -oP '\d+(?=%)' | \
-            while read -r percent; do
-                echo -ne "  Прогресс: $percent%\r"
-            done
-        DL_STATUS=${PIPESTATUS[0]}
-        echo ""
-    else
+    # curl на macOS есть всегда, умеет resume (-C -) и прогресс-бар (-#).
+    # wget — запасной: его прогресс через `grep -oP` несовместим с BSD grep, поэтому
+    # парсинг убран, используется собственный прогресс-бар wget.
+    if command -v curl &> /dev/null; then
         curl -fL -C - -# -o "$MODEL_PATH" "$WHISPER_MODEL_URL"
+        DL_STATUS=$?
+    else
+        wget -c -O "$MODEL_PATH" "$WHISPER_MODEL_URL"
         DL_STATUS=$?
     fi
 
@@ -298,6 +298,21 @@ else
             rm -f "$MODEL_PATH"
             exit 1
         fi
+    fi
+fi
+echo ""
+
+# --- VAD-модель (опционально, для RU-3: VAD=1 против галлюцинаций в паузах) ---
+VAD_MODEL_PATH="$MODEL_DIR/ggml-silero-v5.1.2.bin"
+if [ -f "$VAD_MODEL_PATH" ]; then
+    echo -e "${GREEN}✓ VAD-модель уже скачана${NC}"
+else
+    echo "  Скачиваю VAD-модель (несколько МБ; нужна только для VAD=1)..."
+    if curl -fL -C - -o "$VAD_MODEL_PATH" "$VAD_MODEL_URL"; then
+        echo -e "${GREEN}✓ VAD-модель скачана${NC}"
+    else
+        rm -f "$VAD_MODEL_PATH"
+        echo -e "${YELLOW}⚠ VAD-модель не скачалась — VAD будет недоступен (необязательно)${NC}"
     fi
 fi
 echo ""

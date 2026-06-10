@@ -17,14 +17,14 @@
 | MNT-3 | Maint | ✅ Нет shellcheck/CI | P2 | S | ★★ |
 | INS-1 | Install | ✅ Нет докачки модели (3 ГБ без resume) | P1 | S | ★★ |
 | INS-2 | Install | ✅ «Модель скачана» печатается даже при ошибке | P2 | S | ★ |
-| FEAT-1 | Feature | Субтитры/таймкоды (SRT/VTT/JSON) | P1 | S | ★★★ |
+| FEAT-1 | Feature | ✅ Таймкоды в расшифровке (флаг `TIMESTAMPS=1`) | P1 | S | ★★★ |
 | FEAT-2 | Feature | Контекстный глоссарий (`--initial-prompt`) | P1 | S | ★★★ |
-| FEAT-3 | Feature | Читаемое форматирование (абзацы, перенос строк) | P2 | S | ★★ |
+| FEAT-3 | Feature | ✅ Читаемое форматирование (абзацы, перенос строк) | P2 | S | ★★ |
 | FEAT-4 | Feature | Авто-протокол через LLM (summary + action items) | P2 | M | ★★★ |
 | FEAT-5 | Feature | Опциональная диаризация (кто говорил) | P3 | L | ★★★ |
-| RU-1 | Quality | Зафиксировать язык `-l ru` | P0 | S | ★★ |
-| RU-2 | Quality | Профиль «макс. качество» (beam/best-of/entropy) | P1 | S | ★★ |
-| RU-3 | Quality | Опциональный VAD против галлюцинаций на паузах | P2 | M | ★★ |
+| RU-1 | Quality | ✅ Язык настраивается (`TRANSCRIBE_LANG`, по умолч. auto) | P0 | S | ★★ |
+| RU-2 | Quality | ✅ Профиль качества (`QUALITY=max\|balanced\|fast`) | P1 | S | ★★ |
+| RU-3 | Quality | ✅ Опциональный VAD (`VAD=1`) против галлюцинаций на паузах | P2 | M | ★★ |
 | RU-4 | Research | Сравнить large-v3 vs русский файнтюн / GigaAM | P3 | M | ★★ |
 
 ---

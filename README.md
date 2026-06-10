@@ -102,6 +102,24 @@ bash <(curl -fsSL https://raw.githubusercontent.com/PMCulture-pro/transcribe-app
 bash "$HOME/Library/Application Support/Transcribe/bin/transcribe.sh" "путь/к/файлу.mov"
 ```
 
+### Настройки (env-переменные)
+
+Передаются перед вызовом скрипта (в командной строке) — управляют качеством и форматом вывода:
+
+```bash
+# Зафиксировать язык + максимальное качество + таймкоды + читаемые абзацы
+TRANSCRIBE_LANG=ru QUALITY=max TIMESTAMPS=1 READABLE=1 \
+  bash "$HOME/Library/Application Support/Transcribe/bin/transcribe.sh" "запись.mov"
+```
+
+| Переменная | Значения | По умолчанию | Что делает |
+|------------|----------|--------------|------------|
+| `TRANSCRIBE_LANG` | `auto`, `ru`, `en`, … | `auto` | Язык распознавания. `ru` убирает ложные детекты на коротких/шумных фразах |
+| `QUALITY` | `fast`, `balanced`, `max` | `balanced` | Точность ↔ скорость. `max` точнее, но в 2–4× медленнее |
+| `TIMESTAMPS` | `0`, `1` | `0` | Таймкоды `[ЧЧ:ММ:СС]` прямо в тексте расшифровки |
+| `READABLE` | `0`, `1` | `0` | Разбивка на абзацы по паузам + перенос длинных строк |
+| `VAD` | `0`, `1` | `0` | Отсекает выдуманный текст в тишине/паузах (нужна VAD-модель из установщика) |
+
 ---
 
 ## Поддерживаемые форматы
