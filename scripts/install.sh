@@ -75,6 +75,8 @@ SERVICES_DIR="$HOME/Library/Services"
 WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"
 # VAD-модель Silero для RU-3 (несколько МБ) — против галлюцинаций в паузах.
 VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
+# Turbo-модель (~1.6 ГБ) — опционально, для MODEL=turbo (~3× быстрее large-v3).
+TURBO_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
 # Канонический transcribe.sh — единый источник правды. Установщик копирует
 # соседний файл при запуске из клона репозитория, иначе докачивает по этому URL.
 TRANSCRIBE_RAW_URL="https://raw.githubusercontent.com/277zdwvw9f-pixel/transcribe-app/main/scripts/transcribe.sh"
@@ -314,6 +316,23 @@ else
         rm -f "$VAD_MODEL_PATH"
         echo -e "${YELLOW}⚠ VAD-модель не скачалась — VAD будет недоступен (необязательно)${NC}"
     fi
+fi
+echo ""
+
+# --- Turbo-модель (опционально, ~1.6 ГБ; только при WITH_TURBO=1) -------------
+TURBO_MODEL_PATH="$MODEL_DIR/ggml-large-v3-turbo.bin"
+if [ -f "$TURBO_MODEL_PATH" ]; then
+    echo -e "${GREEN}✓ Turbo-модель уже скачана${NC}"
+elif [ "${WITH_TURBO:-0}" = "1" ]; then
+    echo "  Скачиваю turbo-модель (~1.6 ГБ; для MODEL=turbo, ~3× быстрее)..."
+    if curl -fL -C - -# -o "$TURBO_MODEL_PATH" "$TURBO_MODEL_URL"; then
+        echo -e "${GREEN}✓ Turbo-модель скачана${NC}"
+    else
+        rm -f "$TURBO_MODEL_PATH"
+        echo -e "${YELLOW}⚠ Turbo-модель не скачалась (необязательно)${NC}"
+    fi
+else
+    echo -e "${BLUE}ℹ Turbo-модель пропущена. Для ~3× ускорения: переустановить с WITH_TURBO=1, затем MODEL=turbo${NC}"
 fi
 echo ""
 

@@ -23,6 +23,9 @@ STATE_FILE="$INSTALL_DIR/last_speed_factor"   # realtime-множитель: с�
 SEED_FACTOR="4.0"                              # стартовая прикидка, пока нет истории
 
 # --- Конфигурация (env-переменные) -------------------------------------------
+# Модель: large (large-v3, по умолчанию) или turbo (large-v3-turbo — ~3× быстрее,
+#         качество сопоставимое; нужна скачанная turbo-модель).
+MODEL="${MODEL:-large}"
 # RU-1: язык. auto = автоопределение; ru/en/… — зафиксировать (убирает ложные
 #       детекты на коротких/шумных фразах, чуть быстрее старт).
 LANG_CODE="${TRANSCRIBE_LANG:-auto}"
@@ -72,16 +75,28 @@ OUTPUT_NAME="${INPUT_NAME}.txt"
 OUTPUT_TXT="$INPUT_DIR/${OUTPUT_NAME}"
 PROGRESS_TXT="$INPUT_DIR/${INPUT_NAME}.InProgress.txt"
 
-# --- Поиск модели (переиспользуем уже скачанную) -----------------------------
-MODEL_PATH=""
-for m in \
-    "$INSTALL_DIR/models/ggml-large-v3.bin" \
-    "$HOME/.cache/whisper/ggml-large-v3.bin"
-do
-    if [ -f "$m" ]; then MODEL_PATH="$m"; break; fi
-done
+# --- Выбор и поиск модели (переиспользуем уже скачанную) ----------------------
+case "$MODEL" in
+    turbo) MODEL_FILE="ggml-large-v3-turbo.bin"; MODEL_LABEL="Whisper Large-v3-turbo" ;;
+    *)     MODEL="large"; MODEL_FILE="ggml-large-v3.bin"; MODEL_LABEL="Whisper Large-v3" ;;
+esac
+find_model() {  # печатает путь к файлу-модели $1, если найден
+    for d in "$INSTALL_DIR/models" "$HOME/.cache/whisper"; do
+        [ -f "$d/$1" ] && { printf '%s\n' "$d/$1"; return 0; }
+    done
+    return 1
+}
+MODEL_PATH="$(find_model "$MODEL_FILE")"
+# turbo запрошена, но не скачана → откатываемся на large, чтобы не падать.
+if [ -z "$MODEL_PATH" ] && [ "$MODEL" = "turbo" ]; then
+    MODEL_PATH="$(find_model ggml-large-v3.bin)"
+    if [ -n "$MODEL_PATH" ]; then
+        MODEL_LABEL="Whisper Large-v3"
+        notify "Transcribe" "turbo-модель не найдена — использую large-v3"
+    fi
+fi
 if [ -z "$MODEL_PATH" ]; then
-    notify "Ошибка транскрибации" "AI-модель ggml-large-v3.bin не найдена"
+    notify "Ошибка транскрибации" "AI-модель $MODEL_FILE не найдена"
     exit 1
 fi
 
@@ -327,7 +342,7 @@ build_body
     echo "Старт транскрибации: $START_HUMAN"
     echo "Завершение транскрибации: $FINISH_REAL"
     echo "Время транскрибации: $ELAPSED_FMT"
-    echo "Модель: Whisper Large-v3 (язык: $LANG_CODE, качество: $QUALITY)"
+    echo "Модель: $MODEL_LABEL (язык: $LANG_CODE, качество: $QUALITY)"
     echo "========================================="
     echo ""
     cat "$TRANSCRIPT_BODY"
