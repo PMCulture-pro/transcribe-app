@@ -31,8 +31,6 @@ echo ""
 echo -e "${BLUE}📋 Что будет удалено:${NC}"
 echo ""
 
-TOTAL_SIZE=0
-
 # Проверяем размер установленных компонентов
 if [ -d "$INSTALL_DIR" ]; then
     SIZE=$(du -sh "$INSTALL_DIR" 2>/dev/null | cut -f1)
