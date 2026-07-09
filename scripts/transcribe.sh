@@ -328,8 +328,15 @@ build_body() {
         ' "$SRT" > "$TRANSCRIPT_BODY"
         return
     fi
-    # Обычная сплошная расшифровка.
-    cp "${TEMP_OUTPUT}.txt" "$TRANSCRIPT_BODY"
+    # Обычная сплошная расшифровка. Схлопываем подряд идущие идентичные строки —
+    # страховка от петель-галлюцинаций и в дефолтном (не-srt) выводе Quick Action,
+    # где --max-context 0 остаётся единственной защитой. Сравнение по строке без
+    # крайних пробелов; пустые строки пропускаем как есть.
+    awk '{
+            line=$0; key=line; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
+            if (key == "" || key != prev) print line
+            prev=key
+         }' "${TEMP_OUTPUT}.txt" > "$TRANSCRIPT_BODY"
 }
 
 build_body

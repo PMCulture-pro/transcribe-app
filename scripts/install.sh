@@ -79,14 +79,16 @@ VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-sil
 TURBO_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
 # Канонический transcribe.sh — единый источник правды. Установщик копирует
 # соседний файл при запуске из клона репозитория, иначе докачивает по этому URL.
-TRANSCRIBE_RAW_URL="https://raw.githubusercontent.com/277zdwvw9f-pixel/transcribe-app/main/scripts/transcribe.sh"
+TRANSCRIBE_RAW_URL="https://raw.githubusercontent.com/PMCulture-pro/transcribe-app/main/scripts/transcribe.sh"
 MODEL_SIZE="3.0 GB"
 FFMPEG_SIZE="95 MB"
 TOTAL_SIZE="3.1 GB"
 
-# SHA256 контрольная сумма модели для проверки целостности
-# Источник: https://huggingface.co/ggerganov/whisper.cpp
+# SHA256 контрольные суммы моделей для проверки целостности.
+# Источник: LFS-указатели соответствующих файлов на Hugging Face.
 EXPECTED_MODEL_SHA256="64d182b440b98d5203c4f9bd541544d84c605196c4f7b845dfa11fb23594d1e2"
+EXPECTED_TURBO_SHA256="1fc70f774d38eb169993ac391eea357ef47c88757ef72ee5943879b7e8e2bc69"
+EXPECTED_VAD_SHA256="29940d98d42b91fbd05ce489f3ecf7c72f0a42f027e4875919a28fb4c04ea2cf"
 
 echo -e "${BLUE}╔═══════════════════════════════════════════════════╗${NC}"
 echo -e "${BLUE}║                                                   ║${NC}"
@@ -239,18 +241,24 @@ echo ""
 echo -e "${BLUE}[4/5]${NC} Загрузка AI модели (это займет время)..."
 MODEL_PATH="$MODEL_DIR/ggml-large-v3.bin"
 
-# 0 = SHA совпадает · 1 = не совпадает · 2 = нечем проверить
-verify_model_sha() {
-    local actual=""
+# sha256_file <файл> → печатает sha256 файла или ничего, если нечем считать
+sha256_file() {
     if command -v shasum &> /dev/null; then
-        actual=$(shasum -a 256 "$MODEL_PATH" | cut -d' ' -f1)
+        shasum -a 256 "$1" | cut -d' ' -f1
     elif command -v sha256sum &> /dev/null; then
-        actual=$(sha256sum "$MODEL_PATH" | cut -d' ' -f1)
-    else
-        return 2
+        sha256sum "$1" | cut -d' ' -f1
     fi
-    [ "$actual" = "$EXPECTED_MODEL_SHA256" ]
 }
+
+# verify_sha <файл> <ожидаемая-sha> → 0 совпадает · 1 не совпадает · 2 нечем проверить
+verify_sha() {
+    local actual; actual=$(sha256_file "$1")
+    [ -z "$actual" ] && return 2
+    [ "$actual" = "$2" ]
+}
+
+# 0 = SHA совпадает · 1 = не совпадает · 2 = нечем проверить
+verify_model_sha() { verify_sha "$MODEL_PATH" "$EXPECTED_MODEL_SHA256"; }
 
 # Готовая модель определяется по контрольной сумме, а не по факту существования
 # файла: иначе оборванная закачка считалась бы «уже скачанной». См. BACKLOG INS-1.
@@ -269,15 +277,15 @@ else
     # curl на macOS есть всегда, умеет resume (-C -) и прогресс-бар (-#).
     # wget — запасной: его прогресс через `grep -oP` несовместим с BSD grep, поэтому
     # парсинг убран, используется собственный прогресс-бар wget.
+    # set -e иначе оборвёт скрипт на неудачном curl ДО проверки кода — ловим через ||.
+    DL_STATUS=0
     if command -v curl &> /dev/null; then
-        curl -fL -C - -# -o "$MODEL_PATH" "$WHISPER_MODEL_URL"
-        DL_STATUS=$?
+        curl -fL -C - -# -o "$MODEL_PATH" "$WHISPER_MODEL_URL" || DL_STATUS=$?
     else
-        wget -c -O "$MODEL_PATH" "$WHISPER_MODEL_URL"
-        DL_STATUS=$?
+        wget -c -O "$MODEL_PATH" "$WHISPER_MODEL_URL" || DL_STATUS=$?
     fi
 
-    # Пайп wget|grep|while скрывает код возврата от set -e — проверяем явно. INS-2.
+    # Явная проверка кода возврата загрузки (INS-2).
     if [ "$DL_STATUS" -ne 0 ]; then
         echo -e "${RED}✗ Ошибка загрузки модели (код $DL_STATUS)${NC}"
         echo -e "${RED}  Запустите установщик ещё раз — закачка продолжится с места обрыва.${NC}"
@@ -306,30 +314,32 @@ echo ""
 
 # --- VAD-модель (опционально, для RU-3: VAD=1 против галлюцинаций в паузах) ---
 VAD_MODEL_PATH="$MODEL_DIR/ggml-silero-v5.1.2.bin"
-if [ -f "$VAD_MODEL_PATH" ]; then
-    echo -e "${GREEN}✓ VAD-модель уже скачана${NC}"
+if [ -f "$VAD_MODEL_PATH" ] && verify_sha "$VAD_MODEL_PATH" "$EXPECTED_VAD_SHA256"; then
+    echo -e "${GREEN}✓ VAD-модель уже скачана и проверена${NC}"
 else
     echo "  Скачиваю VAD-модель (несколько МБ; нужна только для VAD=1)..."
-    if curl -fL -C - -o "$VAD_MODEL_PATH" "$VAD_MODEL_URL"; then
-        echo -e "${GREEN}✓ VAD-модель скачана${NC}"
+    if curl -fL -C - -o "$VAD_MODEL_PATH" "$VAD_MODEL_URL" && \
+       verify_sha "$VAD_MODEL_PATH" "$EXPECTED_VAD_SHA256"; then
+        echo -e "${GREEN}✓ VAD-модель скачана и проверена${NC}"
     else
         rm -f "$VAD_MODEL_PATH"
-        echo -e "${YELLOW}⚠ VAD-модель не скачалась — VAD будет недоступен (необязательно)${NC}"
+        echo -e "${YELLOW}⚠ VAD-модель не скачалась или не прошла проверку — VAD недоступен (необязательно)${NC}"
     fi
 fi
 echo ""
 
 # --- Turbo-модель (опционально, ~1.6 ГБ; только при WITH_TURBO=1) -------------
 TURBO_MODEL_PATH="$MODEL_DIR/ggml-large-v3-turbo.bin"
-if [ -f "$TURBO_MODEL_PATH" ]; then
-    echo -e "${GREEN}✓ Turbo-модель уже скачана${NC}"
+if [ -f "$TURBO_MODEL_PATH" ] && verify_sha "$TURBO_MODEL_PATH" "$EXPECTED_TURBO_SHA256"; then
+    echo -e "${GREEN}✓ Turbo-модель уже скачана и проверена${NC}"
 elif [ "${WITH_TURBO:-0}" = "1" ]; then
     echo "  Скачиваю turbo-модель (~1.6 ГБ; для MODEL=turbo, ~3× быстрее)..."
-    if curl -fL -C - -# -o "$TURBO_MODEL_PATH" "$TURBO_MODEL_URL"; then
-        echo -e "${GREEN}✓ Turbo-модель скачана${NC}"
+    if curl -fL -C - -# -o "$TURBO_MODEL_PATH" "$TURBO_MODEL_URL" && \
+       verify_sha "$TURBO_MODEL_PATH" "$EXPECTED_TURBO_SHA256"; then
+        echo -e "${GREEN}✓ Turbo-модель скачана и проверена${NC}"
     else
         rm -f "$TURBO_MODEL_PATH"
-        echo -e "${YELLOW}⚠ Turbo-модель не скачалась (необязательно)${NC}"
+        echo -e "${YELLOW}⚠ Turbo-модель не скачалась или не прошла проверку (необязательно)${NC}"
     fi
 else
     echo -e "${BLUE}ℹ Turbo-модель пропущена. Для ~3× ускорения: переустановить с WITH_TURBO=1, затем MODEL=turbo${NC}"
@@ -573,17 +583,17 @@ cat > "$WORKFLOW_PATH/Contents/Info.plist" << EOF
                 <key>NSApplicationIdentifier</key>
                 <string>com.apple.finder</string>
             </dict>
+            <!-- Реальные медиа-UTI покрывают mp3/mov/mp4/m4a/wav/flac/ogg/aac/avi/webm/wma.
+                 public.data не используем: он показывал бы пункт на ВСЕХ файлах (pdf/txt/…).
+                 mkv/opus имеют на macOS только динамический dyn.* UTI и в меню не попадут —
+                 для них используйте запуск из командной строки. -->
             <key>NSSendFileTypes</key>
             <array>
                 <string>public.movie</string>
                 <string>public.audio</string>
                 <string>public.audiovisual-content</string>
                 <string>public.mpeg-4</string>
-                <string>org.matroska.mkv</string>
                 <string>org.webmproject.webm</string>
-                <!-- public.data: показывать пункт для всех форматов, что читает ffmpeg
-                     (flac/ogg и пр.), не подпадающих под UTI выше. См. BACKLOG BUG-3. -->
-                <string>public.data</string>
             </array>
         </dict>
     </array>
@@ -591,18 +601,55 @@ cat > "$WORKFLOW_PATH/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-# document.wflow для workflow
+# document.wflow для workflow — полная, проверенная версия (надёжно регистрируется
+# в контекстном меню Finder; минимальный вариант мог не отображаться).
 cat > "$WORKFLOW_PATH/Contents/document.wflow" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>AMApplicationBuild</key>
+    <string>521</string>
+    <key>AMApplicationVersion</key>
+    <string>2.10</string>
+    <key>AMDocumentVersion</key>
+    <string>2</string>
     <key>actions</key>
     <array>
         <dict>
             <key>action</key>
             <dict>
                 <key>AMAccepts</key>
+                <dict>
+                    <key>Container</key>
+                    <string>List</string>
+                    <key>Optional</key>
+                    <false/>
+                    <key>Types</key>
+                    <array>
+                        <string>com.apple.cocoa.path</string>
+                    </array>
+                </dict>
+                <key>AMActionVersion</key>
+                <string>2.0.3</string>
+                <key>AMApplication</key>
+                <array>
+                    <string>Automator</string>
+                </array>
+                <key>AMParameterProperties</key>
+                <dict>
+                    <key>COMMAND_STRING</key>
+                    <dict/>
+                    <key>CheckedForUserDefaultShell</key>
+                    <dict/>
+                    <key>inputMethod</key>
+                    <dict/>
+                    <key>shell</key>
+                    <dict/>
+                    <key>source</key>
+                    <dict/>
+                </dict>
+                <key>AMProvides</key>
                 <dict>
                     <key>Container</key>
                     <string>List</string>
@@ -631,9 +678,130 @@ done</string>
                     <key>source</key>
                     <string></string>
                 </dict>
+                <key>BundleIdentifier</key>
+                <string>com.apple.RunShellScript</string>
+                <key>CFBundleVersion</key>
+                <string>2.0.3</string>
+                <key>CanShowSelectedItemsWhenRun</key>
+                <false/>
+                <key>CanShowWhenRun</key>
+                <true/>
+                <key>Category</key>
+                <array>
+                    <string>AMCategoryUtilities</string>
+                </array>
+                <key>Class Name</key>
+                <string>RunShellScriptAction</string>
+                <key>InputUUID</key>
+                <string>A1B2C3D4-0001-0001-0001-000000000001</string>
+                <key>Keywords</key>
+                <array>
+                    <string>Shell</string>
+                    <string>Script</string>
+                    <string>Command</string>
+                    <string>Run</string>
+                    <string>Unix</string>
+                </array>
+                <key>OutputUUID</key>
+                <string>A1B2C3D4-0002-0002-0002-000000000002</string>
+                <key>UUID</key>
+                <string>A1B2C3D4-0003-0003-0003-000000000003</string>
+                <key>UnlocalizedApplications</key>
+                <array>
+                    <string>Automator</string>
+                </array>
+                <key>arguments</key>
+                <dict>
+                    <key>0</key>
+                    <dict>
+                        <key>default value</key>
+                        <integer>0</integer>
+                        <key>name</key>
+                        <string>inputMethod</string>
+                        <key>required</key>
+                        <string>0</string>
+                        <key>type</key>
+                        <string>0</string>
+                        <key>uuid</key>
+                        <string>0</string>
+                    </dict>
+                    <key>1</key>
+                    <dict>
+                        <key>default value</key>
+                        <false/>
+                        <key>name</key>
+                        <string>CheckedForUserDefaultShell</string>
+                        <key>required</key>
+                        <string>0</string>
+                        <key>type</key>
+                        <string>0</string>
+                        <key>uuid</key>
+                        <string>1</string>
+                    </dict>
+                    <key>2</key>
+                    <dict>
+                        <key>default value</key>
+                        <string></string>
+                        <key>name</key>
+                        <string>source</string>
+                        <key>required</key>
+                        <string>0</string>
+                        <key>type</key>
+                        <string>0</string>
+                        <key>uuid</key>
+                        <string>2</string>
+                    </dict>
+                    <key>3</key>
+                    <dict>
+                        <key>default value</key>
+                        <string></string>
+                        <key>name</key>
+                        <string>COMMAND_STRING</string>
+                        <key>required</key>
+                        <string>0</string>
+                        <key>type</key>
+                        <string>0</string>
+                        <key>uuid</key>
+                        <string>3</string>
+                    </dict>
+                    <key>4</key>
+                    <dict>
+                        <key>default value</key>
+                        <string>/bin/sh</string>
+                        <key>name</key>
+                        <string>shell</string>
+                        <key>required</key>
+                        <string>0</string>
+                        <key>type</key>
+                        <string>0</string>
+                        <key>uuid</key>
+                        <string>4</string>
+                    </dict>
+                </dict>
+                <key>isViewVisible</key>
+                <integer>1</integer>
+                <key>location</key>
+                <string>309.000000:253.000000</string>
+                <key>nibPath</key>
+                <string>/System/Library/Automator/Run Shell Script.action/Contents/Resources/Base.lproj/main.nib</string>
             </dict>
+            <key>isViewVisible</key>
+            <integer>1</integer>
         </dict>
     </array>
+    <key>connectors</key>
+    <dict/>
+    <key>workflowMetaData</key>
+    <dict>
+        <key>serviceInputTypeIdentifier</key>
+        <string>com.apple.Automator.fileSystemObject</string>
+        <key>serviceOutputTypeIdentifier</key>
+        <string>com.apple.Automator.nothing</string>
+        <key>serviceProcessesInput</key>
+        <integer>0</integer>
+        <key>workflowTypeIdentifier</key>
+        <string>com.apple.Automator.servicesMenu</string>
+    </dict>
 </dict>
 </plist>
 EOF
