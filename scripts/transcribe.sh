@@ -120,7 +120,7 @@ fi
 TEMP_DIR="${TMPDIR:-/tmp}"
 TEMP_AUDIO="$TEMP_DIR/transcribe_$$.wav"
 TEMP_OUTPUT="$TEMP_DIR/transcribe_$$_out"
-cleanup() { rm -f "$TEMP_AUDIO" "${TEMP_OUTPUT}.txt" "${TEMP_OUTPUT}.srt" "${TEMP_OUTPUT}.body"; }
+cleanup() { rm -f "$TEMP_AUDIO" "${TEMP_OUTPUT}.txt" "${TEMP_OUTPUT}.srt" "${TEMP_OUTPUT}.body" "${TEMP_OUTPUT}.clean" "${TEMP_OUTPUT}.removed"; }
 trap cleanup EXIT
 
 "$FFMPEG_BIN" -nostdin -i "$INPUT_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le "$TEMP_AUDIO" -y >/dev/null 2>&1
@@ -208,6 +208,7 @@ command -v caffeinate >/dev/null 2>&1 && CAFFEINATE=(caffeinate -i)
     "${QUALITY_ARGS[@]}" \
     "${VAD_ARGS[@]}" \
     "${TS_ARGS[@]}" \
+    --suppress-nst \
     --print-progress \
     --output-txt \
     --output-file "$TEMP_OUTPUT" 2>&1 | {
@@ -341,6 +342,33 @@ build_body() {
 
 build_body
 
+# --- Фильтр служебных «титров»-галлюцинаций Whisper --------------------------
+# Whisper (обучен в т.ч. на YouTube-субтитрах) на тишине/шуме/паузах выдумывает
+# подписи авторов субтитров: «Субтитры сделал DimaTorzok», «Amara.org»,
+# «Продолжение следует», «Спасибо за просмотр» и т.п. Вырезаем такие строки.
+# Что удалено — пишем рядом в «<имя>.filtered.txt» для сверки (чтобы убедиться,
+# что легитимный текст не пострадал). Отключить целиком: FILTER=0.
+# Паттерны — регистронезависимые «внутренние» подстроки (без опоры на grep -i,
+# который для кириллицы ненадёжен): «убтитр» ловит Субтитры/субтитров/… .
+FILTER="${FILTER:-1}"
+SUPPRESS_REGEX="${SUPPRESS_REGEX:-убтитр|DimaTorzok|mara\.org|родолжение следует|пасибо за просмотр}"
+FILTERED_COUNT=0
+if [ "$FILTER" = "1" ]; then
+    grep -vE "$SUPPRESS_REGEX" "$TRANSCRIPT_BODY" > "${TEMP_OUTPUT}.clean" 2>/dev/null || cp "$TRANSCRIPT_BODY" "${TEMP_OUTPUT}.clean"
+    grep -nE  "$SUPPRESS_REGEX" "$TRANSCRIPT_BODY" > "${TEMP_OUTPUT}.removed" 2>/dev/null || true
+    FILTERED_COUNT=$(grep -c . "${TEMP_OUTPUT}.removed" 2>/dev/null || echo 0)
+    cp "${TEMP_OUTPUT}.clean" "$TRANSCRIPT_BODY"
+    if [ "$FILTERED_COUNT" -gt 0 ]; then
+        {
+            echo "Отфильтровано как вероятные галлюцинации Whisper (титры/подписи на тишине)."
+            echo "Исходный файл: $INPUT_NAME · Дата: $(date '+%Y-%m-%d %H:%M:%S')"
+            echo "Если среди строк ниже есть реальная речь — сообщите, поправим фильтр (FILTER=0 отключает)."
+            echo "-----------------------------------------"
+            cat "${TEMP_OUTPUT}.removed"
+        } > "$INPUT_DIR/${INPUT_NAME}.filtered.txt" 2>/dev/null
+    fi
+fi
+
 # --- Финальный файл с результатом --------------------------------------------
 {
     echo "========================================="
@@ -350,6 +378,7 @@ build_body
     echo "Завершение транскрибации: $FINISH_REAL"
     echo "Время транскрибации: $ELAPSED_FMT"
     echo "Модель: $MODEL_LABEL (язык: $LANG_CODE, качество: $QUALITY)"
+    [ "${FILTERED_COUNT:-0}" -gt 0 ] && echo "Отфильтровано служебных строк (титры): $FILTERED_COUNT → ${INPUT_NAME}.filtered.txt"
     echo "========================================="
     echo ""
     cat "$TRANSCRIPT_BODY"
