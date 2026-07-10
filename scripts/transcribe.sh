@@ -357,7 +357,7 @@ FILTERED_COUNT=0
 if [ "$FILTER" = "1" ]; then
     grep -vE "$SUPPRESS_REGEX" "$TRANSCRIPT_BODY" > "${TEMP_OUTPUT}.clean" 2>/dev/null || cp "$TRANSCRIPT_BODY" "${TEMP_OUTPUT}.clean"
     grep -nE  "$SUPPRESS_REGEX" "$TRANSCRIPT_BODY" > "${TEMP_OUTPUT}.removed" 2>/dev/null || true
-    FILTERED_COUNT=$(grep -c . "${TEMP_OUTPUT}.removed" 2>/dev/null || echo 0)
+    FILTERED_COUNT=$(grep -c . "${TEMP_OUTPUT}.removed" 2>/dev/null); FILTERED_COUNT=${FILTERED_COUNT:-0}
     cp "${TEMP_OUTPUT}.clean" "$TRANSCRIPT_BODY"
     if [ "$FILTERED_COUNT" -gt 0 ]; then
         {
