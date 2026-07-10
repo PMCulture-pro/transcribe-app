@@ -32,8 +32,9 @@ LANG_CODE="${TRANSCRIBE_LANG:-auto}"
 # RU-2: профиль качества. max — точнее, но в 2–4× медленнее; fast — жадный поиск.
 #       Самообучающийся множитель времени подстроится сам.
 QUALITY="${QUALITY:-balanced}"
-# RU-3: VAD против галлюцинаций в тишине/паузах (нужна скачанная VAD-модель).
-USE_VAD="${VAD:-0}"
+# RU-3: VAD против галлюцинаций в тишине/паузах. auto = включить, если VAD-модель
+#       скачана (ставится установщиком); 1 = принудительно; 0 = выключить.
+USE_VAD="${VAD:-auto}"
 VAD_MODEL_PATH="$INSTALL_DIR/models/ggml-silero-v5.1.2.bin"
 # FEAT-1: TIMESTAMPS=1 — вставить таймкоды [ЧЧ:ММ:СС] прямо в расшифровку.
 USE_TIMESTAMPS="${TIMESTAMPS:-0}"
@@ -181,10 +182,10 @@ case "$QUALITY" in
 esac
 
 VAD_ARGS=()
-if [ "$USE_VAD" = "1" ]; then
+if [ "$USE_VAD" != "0" ]; then
     if [ -f "$VAD_MODEL_PATH" ]; then
         VAD_ARGS=(--vad --vad-model "$VAD_MODEL_PATH")
-    else
+    elif [ "$USE_VAD" = "1" ]; then
         notify "Transcribe" "VAD-модель не найдена — продолжаю без VAD"
     fi
 fi
