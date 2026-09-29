@@ -134,7 +134,7 @@ echo "    Размер: <1 MB"
 echo ""
 if [ "${WITH_GIGAAM:-0}" = "1" ]; then
     echo "  ✓ GigaAM v3 E2E-RNN-T (Sber) - вторая AI модель: каждый файл распознаётся"
-    echo "    двумя сетями, рядом появляются <имя>.txt (Whisper) и <имя>.gigaam.txt (GigaAM)"
+    echo "    двумя сетями, рядом появляются <имя>.whisper.txt и <имя>.gigaam.txt"
     echo "    + разметка спикеров (SPEAKERS=auto в файле настроек)"
     echo "    Размер: $GIGAAM_SIZE (Python-окружение с PyTorch + модель)"
     echo ""
@@ -1029,7 +1029,7 @@ echo "  3. Кликните правой кнопкой мыши → Quick Actio
 echo "  4. Дождитесь уведомления о завершении"
 echo "  5. Текстовый файл появится рядом с исходным файлом"
 if [ "$GIGAAM_STATUS" = "ok" ]; then
-    echo "     Файлов будет два: <имя>.txt (Whisper) и <имя>.gigaam.txt (GigaAM v3) —"
+    echo "     Файлов будет два: <имя>.whisper.txt и <имя>.gigaam.txt (GigaAM v3) —"
     echo "     одна запись, два независимых распознавания. Только Whisper: ENGINE=whisper"
 fi
 echo ""

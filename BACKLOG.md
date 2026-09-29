@@ -136,7 +136,7 @@ WeSpeaker ResNet34-LM, ~35 MB, SHA256 в install.sh). Включается `SPEA
 по Silero VAD (`vad-speech-segments`). GigaAM с `--srt` закрывает чанк на паузе > 1 с.
 
 ### FEAT-6 · Двойная расшифровка Whisper + GigaAM · P2 · M · ✅
-Одна запись → две независимые расшифровки: `<имя>.txt` (Whisper) и `<имя>.gigaam.txt`
+Одна запись → две независимые расшифровки: `<имя>.whisper.txt` (Whisper; до 09.2026 — `<имя>.txt`) и `<имя>.gigaam.txt`
 ([GigaAM v3 E2E-RNN-T](https://github.com/salute-developers/GigaAM), Sber — с пунктуацией и заглавными).
 Сети ошибаются по-разному, поэтому пара расшифровок полезнее одной: сверка спорных мест, сведение через LLM (FEAT-4).
 

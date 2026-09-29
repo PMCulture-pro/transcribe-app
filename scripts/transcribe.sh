@@ -6,7 +6,7 @@
 #   • При старте рядом с исходником создаётся файл "<имя.ext>.InProgress.txt" со
 #     временем старта, оценкой длительности и ожидаемым временем завершения
 #     (расширение .txt — чтобы открывался Quick Look / пробелом).
-#   • По завершении рядом появляются результаты: "<имя.ext>.txt" (Whisper) и/или
+#   • По завершении рядом появляются результаты: "<имя.ext>.whisper.txt" (Whisper) и/или
 #     "<имя.ext>.gigaam.txt" (GigaAM v3 E2E-RNN-T) — одно и то же аудио, распознанное
 #     двумя независимыми сетями. .InProgress.txt удаляется (если удалить не удалось —
 #     остаётся, пользователь уберёт сам).
@@ -190,10 +190,11 @@ fi
 
 INPUT_DIR=$(dirname "$INPUT_FILE")
 INPUT_NAME=$(basename "$INPUT_FILE")
-# Расширение входит в имя результата (meeting.mp4 → meeting.mp4.txt): иначе
-# meeting.mp3 и meeting.mp4 дали бы один meeting.txt (второй затёр бы первый),
+# Расширение входит в имя результата (meeting.mp4 → meeting.mp4.whisper.txt): иначе
+# meeting.mp3 и meeting.mp4 дали бы один результат (второй затёр бы первый),
 # и легко затереть заметки пользователя meeting.txt. См. BACKLOG BUG-1.
-OUTPUT_NAME="${INPUT_NAME}.txt"                  # результат Whisper
+# Суффикс движка — по аналогии с .gigaam.txt: сразу видно, какая сеть писала файл.
+OUTPUT_NAME="${INPUT_NAME}.whisper.txt"          # результат Whisper
 OUTPUT_TXT="$INPUT_DIR/${OUTPUT_NAME}"
 GIGAAM_OUTPUT_NAME="${INPUT_NAME}.gigaam.txt"    # результат GigaAM
 GIGAAM_OUTPUT_TXT="$INPUT_DIR/${GIGAAM_OUTPUT_NAME}"
