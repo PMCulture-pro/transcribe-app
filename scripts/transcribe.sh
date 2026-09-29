@@ -34,7 +34,7 @@ SETTINGS_FILE="$INSTALL_DIR/settings.txt"      # пользовательски�
 # записать в settings.txt. Приоритет: env из командной строки > файл > умолчания ниже.
 # Файл НЕ исполняется как shell: читаются только строки КЛЮЧ=значение с известными
 # ключами (опечатка или мусор в файле не сломают запуск).
-SETTING_KEYS="ENGINE MODEL TRANSCRIBE_LANG QUALITY VAD TIMESTAMPS READABLE PARA_GAP WRAP_WIDTH STRIP_FILLERS WHISPER_CLEANUP GIGAAM_DEVICE SPEAKERS"
+SETTING_KEYS="ENGINE MODEL TRANSCRIBE_LANG QUALITY VAD TIMESTAMPS READABLE PARA_GAP PARA_MAX WRAP_WIDTH STRIP_FILLERS WHISPER_CLEANUP GIGAAM_DEVICE SPEAKERS"
 
 write_settings_template() {  # создаёт шаблон, если файла ещё нет (существующий не трогаем)
     [ -e "$SETTINGS_FILE" ] && return 0
@@ -68,6 +68,8 @@ write_settings_template() {  # создаёт шаблон, если файла 
 #READABLE=0
 # Пауза (сек) между репликами, после которой начинается новый абзац, и ширина строки
 #PARA_GAP=2.0
+# Максимальная длина абзаца (сек): в монологе без пауз новый абзац с таймкодом не реже
+#PARA_MAX=180
 #WRAP_WIDTH=90
 
 # VAD для Whisper — отсекать выдуманный текст в тишине: auto (если модель скачана) | 1 | 0
@@ -139,6 +141,7 @@ USE_TIMESTAMPS="${TIMESTAMPS:-0}"
 # FEAT-3: READABLE=1 — разбивка на абзацы по паузам + перенос длинных строк (оба движка).
 USE_READABLE="${READABLE:-0}"
 PARA_GAP="${PARA_GAP:-2.0}"   # пауза (сек) между репликами → новый абзац
+PARA_MAX="${PARA_MAX:-180}"   # абзац не длиннее (сек): в монологе таймкод не реже раза в 3 мин
 WRAP_WIDTH="${WRAP_WIDTH:-90}" # ширина переноса строк для читаемого режима
 # STRIP_FILLERS=1 — убрать междометия-растяжки «э-э», «а-а», «м-м» (GigaAM пишет их
 #   дословно, Whisper — изредка). Оба движка.
@@ -641,15 +644,16 @@ PY
 # --- Тело расшифровки --------------------------------------------------------
 # FEAT-3: читаемый режим — абзацы по паузам + перенос строк. На python3, потому
 # что awk/fold на macOS считают байты и рвут кириллицу (UTF-8). Аргументы:
-# PARA_GAP WRAP_WIDTH USE_TIMESTAMPS SRT.
+# PARA_GAP WRAP_WIDTH USE_TIMESTAMPS SRT PARA_MAX.
 format_readable() {  # $1 — путь к .srt
-    python3 - "$PARA_GAP" "$WRAP_WIDTH" "$USE_TIMESTAMPS" "$1" <<'PY'
+    python3 - "$PARA_GAP" "$WRAP_WIDTH" "$USE_TIMESTAMPS" "$1" "$PARA_MAX" <<'PY'
 import sys, re, textwrap
 
-gap     = float(sys.argv[1])
-width   = int(sys.argv[2])
-want_ts = sys.argv[3] == "1"
-path    = sys.argv[4]
+gap      = float(sys.argv[1])
+width    = int(sys.argv[2])
+want_ts  = sys.argv[3] == "1"
+path     = sys.argv[4]
+para_max = float(sys.argv[5])
 
 def tosec(t):
     h, m, rest = t.split(":")
@@ -677,14 +681,16 @@ for c in cues:
     deduped.append(c)
 cues = deduped
 
-# Группируем в абзацы: пауза между репликами > gap → новый абзац.
-paras, cur, cur_ts, prev_end = [], [], None, None
+# Группируем в абзацы: пауза между репликами > gap → новый абзац; абзац длиннее
+# para_max секунд (монолог без пауз) тоже закрываем на границе реплики — иначе
+# таймкод стоял бы один на много минут.
+paras, cur, cur_ts, cur_start, prev_end = [], [], None, None, None
 for s, label, e, text in cues:
-    if prev_end is not None and (s - prev_end) > gap and cur:
+    if cur and ((s - prev_end) > gap or (e - cur_start) > para_max):
         paras.append((cur_ts, " ".join(cur)))
         cur = []
     if not cur:
-        cur_ts = label
+        cur_ts, cur_start = label, s
     cur.append(text)
     prev_end = e
 if cur:
@@ -705,16 +711,19 @@ PY
 
 # FEAT-5: расшифровка по спикерам. Каждой реплике .srt назначается спикер с наибольшим
 # перекрытием по времени (диаризация одна на оба движка); подряд идущие реплики одного
-# спикера — один абзац «Спикер N: …», новый абзац также после паузы > PARA_GAP.
+# спикера — один абзац «Спикер N: …», новый абзац также после паузы > PARA_GAP и
+# если абзац длиннее PARA_MAX секунд (монолог — таймкод не реже раза в PARA_MAX).
+# Нашёлся один спикер — подписи «Спикер 1:» не пишем (в шапке всё равно «Спикеры: 1»).
 # С TIMESTAMPS — таймкод в начале абзаца, с READABLE — перенос строк. Аргументы:
-# PARA_GAP WRAP_WIDTH USE_TIMESTAMPS USE_READABLE SRT TURNS.
+# PARA_GAP WRAP_WIDTH USE_TIMESTAMPS USE_READABLE SRT TURNS PARA_MAX.
 format_speakers() {  # $1 — путь к .srt
-    python3 - "$PARA_GAP" "$WRAP_WIDTH" "$USE_TIMESTAMPS" "$USE_READABLE" "$1" "$TEMP_TURNS" <<'PY'
+    python3 - "$PARA_GAP" "$WRAP_WIDTH" "$USE_TIMESTAMPS" "$USE_READABLE" "$1" "$TEMP_TURNS" "$PARA_MAX" <<'PY'
 import re, sys, textwrap
 
 gap, width = float(sys.argv[1]), int(sys.argv[2])
 want_ts, readable = sys.argv[3] == "1", sys.argv[4] == "1"
 srt_path, turns_path = sys.argv[5], sys.argv[6]
+para_max = float(sys.argv[7])
 
 def tosec(t):
     h, m, rest = t.strip().split()[0].split(":")
@@ -754,7 +763,7 @@ for start, end, text in cues:
     same = bool(paras) and spk == prev_spk
     if same and text.strip().lower() == paras[-1][2][-1].strip().lower():
         pass  # петля-галлюцинация: та же реплика подряд
-    elif same and (start - prev_end) <= gap:
+    elif same and (start - prev_end) <= gap and (end - paras[-1][0]) <= para_max:
         paras[-1][2].append(text)
     else:
         paras.append((start, spk, [text]))
@@ -764,9 +773,10 @@ def hms(sec):
     sec = int(sec)
     return "%02d:%02d:%02d" % (sec // 3600, (sec // 60) % 60, sec % 60)
 
+label_speakers = len({t[2] for t in turns}) > 1
 out = []
 for start, spk, texts in paras:
-    prefix = ("[%s] " % hms(start) if want_ts else "") + ("Спикер %s: " % spk if spk else "")
+    prefix = ("[%s] " % hms(start) if want_ts else "") + ("Спикер %s: " % spk if spk and label_speakers else "")
     body = " ".join(texts)
     if readable:
         out.append(textwrap.fill(body, width=width, initial_indent=prefix,
