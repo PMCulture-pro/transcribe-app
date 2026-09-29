@@ -244,6 +244,10 @@ WHISPER_BIN="$(command -v whisper-cli 2>/dev/null)"
 if [ -z "$WHISPER_BIN" ]; then
     WHISPER_BIN="$(find /opt/homebrew/Cellar/whisper-cpp -name whisper-cli -type f 2>/dev/null | head -n 1)"
 fi
+# vad-speech-segments идёт в комплекте whisper-cpp — нужен для выравнивания таймкодов.
+VAD_SEG_BIN="$(command -v vad-speech-segments 2>/dev/null)"
+[ -z "$VAD_SEG_BIN" ] && [ -n "$WHISPER_BIN" ] && [ -x "$(dirname "$WHISPER_BIN")/vad-speech-segments" ] \
+    && VAD_SEG_BIN="$(dirname "$WHISPER_BIN")/vad-speech-segments"
 FFMPEG_BIN="$(command -v ffmpeg 2>/dev/null)"
 FFPROBE_BIN="$(command -v ffprobe 2>/dev/null)"
 if [ "$RUN_WHISPER" = "1" ] && { [ -z "$WHISPER_BIN" ] || [ ! -x "$WHISPER_BIN" ]; }; then
@@ -262,7 +266,7 @@ TEMP_WHISPER="$TEMP_DIR/transcribe_$$_whisper"   # база временных �
 TEMP_GIGAAM="$TEMP_DIR/transcribe_$$_gigaam"     # база временных файлов GigaAM (.txt/.srt/.body/.meta)
 cleanup() {
     rm -f "$TEMP_AUDIO"
-    for b in "$TEMP_WHISPER" "$TEMP_GIGAAM"; do rm -f "$b.txt" "$b.srt" "$b.body" "$b.meta" "$b.removed"; done
+    for b in "$TEMP_WHISPER" "$TEMP_GIGAAM"; do rm -f "$b.txt" "$b.srt" "$b.body" "$b.meta" "$b.removed" "$b.vad"; done
 }
 trap cleanup EXIT
 
@@ -524,6 +528,73 @@ if os.path.exists(srt):
 PY
 }
 
+# --- Выравнивание таймкодов Whisper по реальной речи ---------------------------
+# whisper.cpp (1.8, и с VAD, и без) выдаёт сегменты встык: начало реплики = конец
+# предыдущей, поэтому пауза «приклеивается» к следующей фразе — её таймкод раньше
+# реального на длину паузы (на тесте с паузами 2.7 с: [00:00:05] вместо 7.9 с), а
+# READABLE не видит пауз и не делит на абзацы. Лечим: берём границы речи от Silero
+# VAD (vad-speech-segments, та же модель) и сдвигаем начало реплики на первое
+# начало речи внутри неё, конец — на последний конец речи. Ничего не найдено —
+# таймкод остаётся как был. Нет модели/утилиты/python3 — шаг пропускается.
+align_srt_to_speech() {  # $1 — база временных файлов Whisper
+    [ -f "$1.srt" ] && [ -f "$VAD_MODEL_PATH" ] && [ -n "$VAD_SEG_BIN" ] || return 0
+    command -v python3 >/dev/null 2>&1 || return 0
+    "$VAD_SEG_BIN" -f "$TEMP_AUDIO" --vad-model "$VAD_MODEL_PATH" -np 2>/dev/null > "$1.vad" || return 0
+    python3 - "$1.srt" "$1.vad" <<'PY' 2>/dev/null || true
+import re, sys
+
+srt_path, vad_path = sys.argv[1], sys.argv[2]
+# «Speech segment N: start = 179.00, end = 528.00» — единицы 10 мс (как t0/t1 в whisper.cpp).
+speech = [(float(a) / 100, float(b) / 100) for a, b in
+          re.findall(r"start\s*=\s*([\d.]+),\s*end\s*=\s*([\d.]+)", open(vad_path).read())]
+if not speech:
+    sys.exit(0)
+
+def tosec(t):
+    h, m, rest = t.strip().split(":")
+    return int(h) * 3600 + int(m) * 60 + float(rest.replace(",", "."))
+
+def fmt(sec):
+    ms = int(round(sec * 1000))
+    h, ms = divmod(ms, 3600000); m, ms = divmod(ms, 60000); s, ms = divmod(ms, 1000)
+    return "%02d:%02d:%02d,%03d" % (h, m, s, ms)
+
+cues = []
+for block in re.split(r"\r?\n\r?\n", open(srt_path, encoding="utf-8", errors="replace").read().strip()):
+    ls = block.splitlines()
+    ti = next((i for i, l in enumerate(ls) if "-->" in l), None)
+    if ti is None:
+        continue
+    a, b = ls[ti].split("-->")
+    cues.append([tosec(a), tosec(b), ls[ti + 1:]])
+
+TAIL = 0.6  # речь, заканчивающаяся в первые 0.6 с реплики, — хвост предыдущей фразы
+
+for c in cues:
+    start, end = c[0], c[1]
+    inside = [(s, e) for s, e in speech if s < end and e > start]
+    if not inside:
+        continue
+    # Речь, начавшаяся до реплики, — либо её законное продолжение (оставляем начало),
+    # либо короткий хвост предыдущей фразы: тогда начало — первое начало речи внутри.
+    carry = [e for s, e in inside if s <= start]
+    later = [s for s, _ in inside if s > start]
+    if later and (not carry or max(carry) - start < TAIL):
+        start = min(later)
+        inside = [(s, e) for s, e in inside if s >= start]
+    last_end = max(e for _, e in inside)
+    if last_end < end:                                # хвост реплики — тишина → к концу речи
+        end = last_end
+    if start < end:
+        c[0], c[1] = start, end
+
+with open(srt_path, "w", encoding="utf-8") as f:
+    for n, (s, e, text) in enumerate(cues, 1):
+        f.write("%d\n%s --> %s\n%s\n\n" % (n, fmt(s), fmt(e), "\n".join(text)))
+PY
+    rm -f "$1.vad"
+}
+
 # --- Тело расшифровки --------------------------------------------------------
 # FEAT-3: читаемый режим — абзацы по паузам + перенос строк. На python3, потому
 # что awk/fold на macOS считают байты и рвут кириллицу (UTF-8). Аргументы:
@@ -665,6 +736,7 @@ if [ "$RUN_WHISPER" = "1" ]; then
     W_START_EPOCH=$(date +%s); W_START_HUMAN=$(date '+%Y-%m-%d %H:%M:%S')
     if run_whisper; then
         W_ELAPSED=$(( $(date +%s) - W_START_EPOCH ))
+        align_srt_to_speech "$TEMP_WHISPER"
         postprocess "$TEMP_WHISPER" whisper
         write_filtered_report "$TEMP_WHISPER"
         write_result "$TEMP_WHISPER" "$OUTPUT_TXT" \
