@@ -46,6 +46,11 @@ if [ -d "$WORKFLOW_PATH" ]; then
     echo ""
 fi
 
+if [ -x "$INSTALL_DIR/gigaam/venv/bin/python" ]; then
+    echo "  ✓ GigaAM v3 (Python-окружение и модель — внутри папки приложения)"
+    echo ""
+fi
+
 # Проверяем Homebrew пакеты
 HOMEBREW_PACKAGES=""
 if command -v brew &> /dev/null; then

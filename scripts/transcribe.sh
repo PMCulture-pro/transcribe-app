@@ -1,17 +1,22 @@
 #!/bin/bash
 #
-# Transcribe — транскрибация одного аудио/видео файла через whisper.cpp.
+# Transcribe — транскрибация одного аудио/видео файла через whisper.cpp и/или GigaAM.
 #
 # Поведение:
 #   • При старте рядом с исходником создаётся файл "<имя.ext>.InProgress.txt" со
 #     временем старта, оценкой длительности и ожидаемым временем завершения
 #     (расширение .txt — чтобы открывался Quick Look / пробелом).
-#   • По завершении создаётся "<имя>.txt" с результатом, а .InProgress.txt
-#     удаляется (если удалить не удалось — остаётся, пользователь уберёт сам).
+#   • По завершении рядом появляются результаты: "<имя.ext>.txt" (Whisper) и/или
+#     "<имя.ext>.gigaam.txt" (GigaAM v3 E2E-RNN-T) — одно и то же аудио, распознанное
+#     двумя независимыми сетями. .InProgress.txt удаляется (если удалить не удалось —
+#     остаётся, пользователь уберёт сам).
 #   • Оценка времени самообучающаяся: реальная скорость машины запоминается
-#     в last_speed_factor и используется для следующих оценок.
+#     отдельно для каждого движка (last_speed_factor, last_speed_factor_gigaam).
+#   • Настройки берутся из env-переменных, а если их нет — из файла settings.txt
+#     рядом с моделями (так настройки действуют и для правого клика в Finder).
 #
 # Использование: transcribe.sh <путь к аудио/видео>
+#                transcribe.sh --init-settings   # создать шаблон settings.txt
 
 # Finder Quick Action запускает скрипт с урезанным PATH (без Homebrew).
 export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
@@ -19,29 +24,135 @@ export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
 INPUT_FILE="$1"
 
 INSTALL_DIR="$HOME/Library/Application Support/Transcribe"
-STATE_FILE="$INSTALL_DIR/last_speed_factor"   # realtime-множитель: сек аудио / сек обработки
+STATE_FILE="$INSTALL_DIR/last_speed_factor"   # realtime-множитель Whisper: сек аудио / сек обработки
 SEED_FACTOR="4.0"                              # стартовая прикидка, пока нет истории
+LOG_DIR="$INSTALL_DIR/logs"                    # вывод движков последнего запуска (для разбора ошибок)
+SETTINGS_FILE="$INSTALL_DIR/settings.txt"      # пользовательские настройки (КЛЮЧ=значение)
 
-# --- Конфигурация (env-переменные) -------------------------------------------
-# Модель: large (large-v3, по умолчанию) или turbo (large-v3-turbo — ~3× быстрее,
+# --- Файл настроек -----------------------------------------------------------
+# Finder Quick Action не умеет передавать env-переменные, поэтому те же ключи можно
+# записать в settings.txt. Приоритет: env из командной строки > файл > умолчания ниже.
+# Файл НЕ исполняется как shell: читаются только строки КЛЮЧ=значение с известными
+# ключами (опечатка или мусор в файле не сломают запуск).
+SETTING_KEYS="ENGINE MODEL TRANSCRIBE_LANG QUALITY VAD TIMESTAMPS READABLE PARA_GAP WRAP_WIDTH STRIP_FILLERS WHISPER_CLEANUP GIGAAM_DEVICE"
+
+write_settings_template() {  # создаёт шаблон, если файла ещё нет (существующий не трогаем)
+    [ -e "$SETTINGS_FILE" ] && return 0
+    mkdir -p "$INSTALL_DIR" 2>/dev/null || return 1
+    cat > "$SETTINGS_FILE" <<'SETTINGS_EOF'
+# Настройки Transcribe. Читаются при каждом запуске — и из Finder, и из командной строки.
+# Формат: КЛЮЧ=значение, по одной настройке в строке. Строки с # в начале — комментарии.
+# Чтобы включить настройку, уберите # перед ней и поставьте нужное значение.
+# Переменные окружения, заданные в командной строке, важнее этого файла.
+
+# Какими сетями распознавать: auto (обе, если GigaAM установлен) | whisper | gigaam | both
+#ENGINE=auto
+
+# Язык для Whisper: auto (автоопределение) | ru | en | … GigaAM всегда русский.
+#TRANSCRIBE_LANG=auto
+
+# Модель Whisper: large | turbo (turbo ~3× быстрее; нужна скачанная turbo-модель)
+#MODEL=large
+
+# Качество Whisper: fast | balanced | max (max точнее, но в 2–4 раза медленнее)
+#QUALITY=balanced
+
+# Таймкоды [ЧЧ:ММ:СС] в тексте: 0 | 1
+#TIMESTAMPS=0
+
+# Разбивка на абзацы по паузам и перенос длинных строк: 0 | 1
+#READABLE=0
+# Пауза (сек) между репликами, после которой начинается новый абзац, и ширина строки
+#PARA_GAP=2.0
+#WRAP_WIDTH=90
+
+# VAD для Whisper — отсекать выдуманный текст в тишине: auto (если модель скачана) | 1 | 0
+#VAD=auto
+
+# Убрать междометия «э-э», «а-а», «м-м» из расшифровки: 0 | 1
+#STRIP_FILLERS=0
+
+# Убирать титры-галлюцинации Whisper («Редактор субтитров…») и повторы строк: 0 | 1
+# Удалённые титры пишутся рядом в «<имя>.filtered.txt» — для сверки.
+#WHISPER_CLEANUP=1
+
+# Где считать GigaAM: auto (GPU с откатом на CPU) | mps | cpu
+#GIGAAM_DEVICE=auto
+SETTINGS_EOF
+}
+
+load_settings() {  # КЛЮЧ=значение построчно; только известные ключи; env важнее файла
+    local line key val
+    [ -f "$SETTINGS_FILE" ] || return 0
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ "$line" =~ ^[[:space:]]*([A-Za-z_]+)[[:space:]]*=(.*)$ ]] || continue
+        key="${BASH_REMATCH[1]}"
+        val="${BASH_REMATCH[2]}"
+        val="${val%%#*}"                          # комментарий после значения
+        val="${val#"${val%%[![:space:]]*}"}"      # пробелы слева
+        val="${val%"${val##*[![:space:]]}"}"      # пробелы справа
+        case "$val" in
+            \"*\") val="${val#\"}"; val="${val%\"}" ;;
+            \'*\') val="${val#\'}"; val="${val%\'}" ;;
+        esac
+        case " $SETTING_KEYS " in *" $key "*) ;; *) continue ;; esac
+        if [ -z "$(eval "printf '%s' \"\${$key+x}\"")" ]; then   # не задано в env → берём из файла
+            eval "$key=\"\$val\""
+        fi
+    done < "$SETTINGS_FILE"
+}
+
+if [ "$INPUT_FILE" = "--init-settings" ]; then
+    write_settings_template && printf '%s\n' "$SETTINGS_FILE"
+    exit $?
+fi
+write_settings_template 2>/dev/null || true
+load_settings
+
+# --- Конфигурация (env-переменные или settings.txt) --------------------------
+# FEAT-6: движок распознавания. whisper | gigaam | both | auto (по умолчанию).
+#   auto = обе сети, если GigaAM установлен (install.sh с WITH_GIGAAM=1) и язык
+#   auto/ru (GigaAM v3 — только русский); иначе только Whisper.
+ENGINE="${ENGINE:-auto}"
+# Модель Whisper: large (large-v3, по умолчанию) или turbo (large-v3-turbo — ~3× быстрее,
 #         качество сопоставимое; нужна скачанная turbo-модель).
 MODEL="${MODEL:-large}"
-# RU-1: язык. auto = автоопределение; ru/en/… — зафиксировать (убирает ложные
-#       детекты на коротких/шумных фразах, чуть быстрее старт).
+# RU-1: язык Whisper. auto (по умолчанию) = автоопределение (~100 языков); ru/en/… —
+#       зафиксировать (убирает ложные детекты на коротких/шумных фразах, чуть быстрее
+#       старт). GigaAM всегда русский: при auto он тоже запускается (ENGINE=auto).
 LANG_CODE="${TRANSCRIBE_LANG:-auto}"
-# RU-2: профиль качества. max — точнее, но в 2–4× медленнее; fast — жадный поиск.
+# RU-2: профиль качества Whisper. max — точнее, но в 2–4× медленнее; fast — жадный поиск.
 #       Самообучающийся множитель времени подстроится сам.
 QUALITY="${QUALITY:-balanced}"
 # RU-3: VAD против галлюцинаций в тишине/паузах. auto = включить, если VAD-модель
-#       скачана (ставится установщиком); 1 = принудительно; 0 = выключить.
+#       скачана (ставится установщиком); 1 = принудительно; 0 = выключить. Только Whisper:
+#       GigaAM режет речь своим VAD (Silero) всегда.
 USE_VAD="${VAD:-auto}"
 VAD_MODEL_PATH="$INSTALL_DIR/models/ggml-silero-v5.1.2.bin"
-# FEAT-1: TIMESTAMPS=1 — вставить таймкоды [ЧЧ:ММ:СС] прямо в расшифровку.
+# FEAT-1: TIMESTAMPS=1 — вставить таймкоды [ЧЧ:ММ:СС] прямо в расшифровку (оба движка).
 USE_TIMESTAMPS="${TIMESTAMPS:-0}"
-# FEAT-3: READABLE=1 — разбивка на абзацы по паузам + перенос длинных строк.
+# FEAT-3: READABLE=1 — разбивка на абзацы по паузам + перенос длинных строк (оба движка).
 USE_READABLE="${READABLE:-0}"
 PARA_GAP="${PARA_GAP:-2.0}"   # пауза (сек) между репликами → новый абзац
 WRAP_WIDTH="${WRAP_WIDTH:-90}" # ширина переноса строк для читаемого режима
+# STRIP_FILLERS=1 — убрать междометия-растяжки «э-э», «а-а», «м-м» (GigaAM пишет их
+#   дословно, Whisper — изредка). Оба движка.
+STRIP_FILLERS="${STRIP_FILLERS:-0}"
+# WHISPER_CLEANUP=1 (по умолчанию) — убрать известные галлюцинации Whisper: титры из
+#   обучающих субтитров («Редактор субтитров…», «Продолжение следует», «Спасибо за
+#   просмотр»), которые он дописывает на тишине или в конце записи, и схлопнуть
+#   одинаковые строки подряд (петли). Удалённые титры — рядом в «<имя>.filtered.txt»
+#   для сверки. Только Whisper. FILTER=0 — прежнее имя выключателя, тоже работает.
+WHISPER_CLEANUP="${WHISPER_CLEANUP:-${FILTER:-1}}"
+# GigaAM: устройство auto | mps | cpu (auto = Metal/MPS на Apple Silicon с откатом на CPU).
+GIGAAM_DEVICE="${GIGAAM_DEVICE:-auto}"
+GIGAAM_PY="$INSTALL_DIR/gigaam/venv/bin/python"
+GIGAAM_RUNNER="$INSTALL_DIR/bin/gigaam_transcribe.py"
+GIGAAM_MODELS_DIR="$INSTALL_DIR/models/gigaam"
+GIGAAM_STATE_FILE="$INSTALL_DIR/last_speed_factor_gigaam"
+GIGAAM_SEED_FACTOR="8.0"
+GIGAAM_LABEL="GigaAM v3 E2E-RNN-T"
 
 # --- Уведомления (безопасно к кавычкам/спецсимволам в тексте) ----------------
 notify() {
@@ -72,11 +183,36 @@ INPUT_NAME=$(basename "$INPUT_FILE")
 # Расширение входит в имя результата (meeting.mp4 → meeting.mp4.txt): иначе
 # meeting.mp3 и meeting.mp4 дали бы один meeting.txt (второй затёр бы первый),
 # и легко затереть заметки пользователя meeting.txt. См. BACKLOG BUG-1.
-OUTPUT_NAME="${INPUT_NAME}.txt"
+OUTPUT_NAME="${INPUT_NAME}.txt"                  # результат Whisper
 OUTPUT_TXT="$INPUT_DIR/${OUTPUT_NAME}"
+GIGAAM_OUTPUT_NAME="${INPUT_NAME}.gigaam.txt"    # результат GigaAM
+GIGAAM_OUTPUT_TXT="$INPUT_DIR/${GIGAAM_OUTPUT_NAME}"
 PROGRESS_TXT="$INPUT_DIR/${INPUT_NAME}.InProgress.txt"
 
-# --- Выбор и поиск модели (переиспользуем уже скачанную) ----------------------
+# --- Выбор движков -----------------------------------------------------------
+gigaam_available() { [ -x "$GIGAAM_PY" ] && [ -f "$GIGAAM_RUNNER" ]; }
+
+RUN_WHISPER=1; RUN_GIGAAM=0
+case "$ENGINE" in
+    whisper) ;;
+    gigaam)  RUN_WHISPER=0; RUN_GIGAAM=1 ;;
+    both)    RUN_GIGAAM=1 ;;
+    *)       ENGINE="auto"
+             if gigaam_available && { [ "$LANG_CODE" = "auto" ] || [ "$LANG_CODE" = "ru" ]; }; then
+                 RUN_GIGAAM=1
+             fi ;;
+esac
+if [ "$RUN_GIGAAM" = "1" ] && ! gigaam_available; then
+    if [ "$RUN_WHISPER" = "1" ]; then
+        notify "Transcribe" "GigaAM не установлен — только Whisper (установка: WITH_GIGAAM=1)"
+        RUN_GIGAAM=0
+    else
+        notify "Ошибка транскрибации" "GigaAM не установлен: запустите install.sh с WITH_GIGAAM=1"
+        exit 1
+    fi
+fi
+
+# --- Выбор и поиск модели Whisper (переиспользуем уже скачанную) --------------
 case "$MODEL" in
     turbo) MODEL_FILE="ggml-large-v3-turbo.bin"; MODEL_LABEL="Whisper Large-v3-turbo" ;;
     *)     MODEL="large"; MODEL_FILE="ggml-large-v3.bin"; MODEL_LABEL="Whisper Large-v3" ;;
@@ -87,18 +223,20 @@ find_model() {  # печатает путь к файлу-модели $1, ес�
     done
     return 1
 }
-MODEL_PATH="$(find_model "$MODEL_FILE")"
-# turbo запрошена, но не скачана → откатываемся на large, чтобы не падать.
-if [ -z "$MODEL_PATH" ] && [ "$MODEL" = "turbo" ]; then
-    MODEL_PATH="$(find_model ggml-large-v3.bin)"
-    if [ -n "$MODEL_PATH" ]; then
-        MODEL_LABEL="Whisper Large-v3"
-        notify "Transcribe" "turbo-модель не найдена — использую large-v3"
+if [ "$RUN_WHISPER" = "1" ]; then
+    MODEL_PATH="$(find_model "$MODEL_FILE")"
+    # turbo запрошена, но не скачана → откатываемся на large, чтобы не падать.
+    if [ -z "$MODEL_PATH" ] && [ "$MODEL" = "turbo" ]; then
+        MODEL_PATH="$(find_model ggml-large-v3.bin)"
+        if [ -n "$MODEL_PATH" ]; then
+            MODEL_LABEL="Whisper Large-v3"
+            notify "Transcribe" "turbo-модель не найдена — использую large-v3"
+        fi
     fi
-fi
-if [ -z "$MODEL_PATH" ]; then
-    notify "Ошибка транскрибации" "AI-модель $MODEL_FILE не найдена"
-    exit 1
+    if [ -z "$MODEL_PATH" ]; then
+        notify "Ошибка транскрибации" "AI-модель $MODEL_FILE не найдена"
+        exit 1
+    fi
 fi
 
 # --- Поиск бинарников --------------------------------------------------------
@@ -108,7 +246,7 @@ if [ -z "$WHISPER_BIN" ]; then
 fi
 FFMPEG_BIN="$(command -v ffmpeg 2>/dev/null)"
 FFPROBE_BIN="$(command -v ffprobe 2>/dev/null)"
-if [ -z "$WHISPER_BIN" ] || [ ! -x "$WHISPER_BIN" ]; then
+if [ "$RUN_WHISPER" = "1" ] && { [ -z "$WHISPER_BIN" ] || [ ! -x "$WHISPER_BIN" ]; }; then
     notify "Ошибка транскрибации" "whisper-cli не найден (brew install whisper-cpp)"
     exit 1
 fi
@@ -120,8 +258,12 @@ fi
 # --- Извлечение аудио в WAV 16 кГц моно --------------------------------------
 TEMP_DIR="${TMPDIR:-/tmp}"
 TEMP_AUDIO="$TEMP_DIR/transcribe_$$.wav"
-TEMP_OUTPUT="$TEMP_DIR/transcribe_$$_out"
-cleanup() { rm -f "$TEMP_AUDIO" "${TEMP_OUTPUT}.txt" "${TEMP_OUTPUT}.srt" "${TEMP_OUTPUT}.body" "${TEMP_OUTPUT}.clean" "${TEMP_OUTPUT}.removed"; }
+TEMP_WHISPER="$TEMP_DIR/transcribe_$$_whisper"   # база временных файлов Whisper (.txt/.srt/.body/.removed)
+TEMP_GIGAAM="$TEMP_DIR/transcribe_$$_gigaam"     # база временных файлов GigaAM (.txt/.srt/.body/.meta)
+cleanup() {
+    rm -f "$TEMP_AUDIO"
+    for b in "$TEMP_WHISPER" "$TEMP_GIGAAM"; do rm -f "$b.txt" "$b.srt" "$b.body" "$b.meta" "$b.removed"; done
+}
 trap cleanup EXIT
 
 "$FFMPEG_BIN" -nostdin -i "$INPUT_FILE" -vn -ac 1 -ar 16000 -c:a pcm_s16le "$TEMP_AUDIO" -y >/dev/null 2>&1
@@ -142,33 +284,66 @@ if [ ! -s "$TEMP_AUDIO" ] || [ "$DUR_INT" -lt 1 ]; then
     exit 1
 fi
 
-# --- Оценка времени (самообучающийся множитель скорости) ---------------------
-FACTOR="$SEED_FACTOR"
-if [ -f "$STATE_FILE" ]; then
-    v=$(cat "$STATE_FILE" 2>/dev/null)
-    if awk -v x="$v" 'BEGIN{exit !(x+0>0)}'; then FACTOR="$v"; fi
-fi
-EST_SECS=$(awk -v d="$DUR_INT" -v f="$FACTOR" 'BEGIN{ if(f<=0)f=4; printf "%d", (d/f)+0.5 }')
-[ "$EST_SECS" -lt 1 ] && EST_SECS=1
+# --- Оценка времени (самообучающийся множитель скорости, свой у каждого движка) ---
+read_factor() {  # печатает выученный множитель из файла $1, иначе стартовый $2
+    local v
+    if [ -f "$1" ]; then
+        v=$(cat "$1" 2>/dev/null)
+        if awk -v x="$v" 'BEGIN{exit !(x+0>0)}'; then printf '%s\n' "$v"; return; fi
+    fi
+    printf '%s\n' "$2"
+}
+est_secs() {  # $1 длительность, $2 множитель → секунды обработки (не меньше 1)
+    awk -v d="$1" -v f="$2" 'BEGIN{ if(f<=0)f=4; s=int((d/f)+0.5); if(s<1)s=1; print s }'
+}
+update_factor() {  # $1 файл состояния, $2 длительность, $3 реальное время — учим множитель (файлы от 60 с)
+    { [ "$2" -ge 60 ] && [ "$3" -gt 0 ]; } || return 0
+    local raw old
+    raw=$(awk -v d="$2" -v e="$3" 'BEGIN{printf "%.3f", d/e}')
+    old=""
+    [ -f "$1" ] && old=$(cat "$1" 2>/dev/null)
+    if [ -n "$old" ] && awk -v o="$old" -v r="$raw" 'BEGIN{exit !(o+0>0 && r+0>0 && r < o/3)}'; then
+        : # Аномально медленный замер (в 3+ раза ниже выученного) — почти наверняка
+          # сон/прерывание во время распознавания. Не обновляем, чтобы не испортить оценку.
+    elif [ -n "$old" ] && awk -v o="$old" 'BEGIN{exit !(o+0>0)}'; then
+        awk -v o="$old" -v n="$raw" 'BEGIN{printf "%.3f", 0.5*o+0.5*n}' > "$1" 2>/dev/null || true
+    else
+        echo "$raw" > "$1" 2>/dev/null || true
+    fi
+}
+
+EST_WHISPER=0; EST_GIGAAM=0
+[ "$RUN_WHISPER" = "1" ] && EST_WHISPER=$(est_secs "$DUR_INT" "$(read_factor "$STATE_FILE" "$SEED_FACTOR")")
+[ "$RUN_GIGAAM" = "1" ]  && EST_GIGAAM=$(est_secs "$DUR_INT" "$(read_factor "$GIGAAM_STATE_FILE" "$GIGAAM_SEED_FACTOR")")
+EST_SECS=$((EST_WHISPER + EST_GIGAAM))
 EST_FMT=$(fmt_hms "$EST_SECS")
 
 START_EPOCH=$(date +%s)
 START_HUMAN=$(date '+%Y-%m-%d %H:%M:%S')
 FINISH_HUMAN=$(date -r $((START_EPOCH + EST_SECS)) '+%Y-%m-%d %H:%M:%S')
 
+# Подписи для индикатора/уведомлений: какие движки и какие файлы ждать.
+ENGINES_LABEL=""; EXPECTED_FILES=""
+if [ "$RUN_WHISPER" = "1" ]; then ENGINES_LABEL="$MODEL_LABEL"; EXPECTED_FILES="«${OUTPUT_NAME}»"; fi
+if [ "$RUN_GIGAAM" = "1" ]; then
+    ENGINES_LABEL="${ENGINES_LABEL:+$ENGINES_LABEL + }$GIGAAM_LABEL"
+    EXPECTED_FILES="${EXPECTED_FILES:+$EXPECTED_FILES и }«${GIGAAM_OUTPUT_NAME}»"
+fi
+
 # --- Файл-индикатор "идёт транскрибация" -------------------------------------
 {
     echo "$INPUT_NAME"
     echo "Старт транскрибации: $START_HUMAN"
     echo "Длительность аудио: $DURATION_FMT"
+    echo "Модели: $ENGINES_LABEL"
     echo "Примерное время транскрибации: $EST_FMT"
     echo "Примерное время завершения транскрибации: $FINISH_HUMAN"
     echo ""
     echo "Идёт распознавание…"
-    echo "Когда закончится, рядом появится файл «${OUTPUT_NAME}», а этот файл исчезнет."
+    echo "Когда закончится, рядом появится $EXPECTED_FILES, а этот файл исчезнет."
 } > "$PROGRESS_TXT" 2>/dev/null
 
-notify "Transcribe" "Начинаю: $INPUT_NAME — примерно $EST_FMT" "Glass"
+notify "Transcribe" "Начинаю: $INPUT_NAME — примерно $EST_FMT ($ENGINES_LABEL)" "Glass"
 
 # --- Сборка аргументов whisper -----------------------------------------------
 # --max-context 0: НЕ переносить предыдущий текст между сегментами. Conditioning
@@ -182,7 +357,7 @@ case "$QUALITY" in
 esac
 
 VAD_ARGS=()
-if [ "$USE_VAD" != "0" ]; then
+if [ "$USE_VAD" != "0" ] && [ "$RUN_WHISPER" = "1" ]; then
     if [ -f "$VAD_MODEL_PATH" ]; then
         VAD_ARGS=(--vad --vad-model "$VAD_MODEL_PATH")
     elif [ "$USE_VAD" = "1" ]; then
@@ -191,9 +366,10 @@ if [ "$USE_VAD" != "0" ]; then
 fi
 
 # .srt нужен и для таймкодов (FEAT-1), и для разбивки на абзацы по паузам (FEAT-3).
-TS_ARGS=()
+TS_ARGS=(); GIGAAM_SRT_ARGS=()
 if [ "$USE_TIMESTAMPS" = "1" ] || [ "$USE_READABLE" = "1" ]; then
     TS_ARGS=(--output-srt)
+    GIGAAM_SRT_ARGS=(--srt)
 fi
 
 # caffeinate -i не даёт системе уснуть в простое во время распознавания: иначе
@@ -201,57 +377,159 @@ fi
 CAFFEINATE=()
 command -v caffeinate >/dev/null 2>&1 && CAFFEINATE=(caffeinate -i)
 
-# --- Транскрибация с пингами прогресса ---------------------------------------
-"${CAFFEINATE[@]}" "$WHISPER_BIN" \
-    -m "$MODEL_PATH" \
-    -f "$TEMP_AUDIO" \
-    -l "$LANG_CODE" \
-    "${QUALITY_ARGS[@]}" \
-    "${VAD_ARGS[@]}" \
-    "${TS_ARGS[@]}" \
-    --suppress-nst \
-    --print-progress \
-    --output-txt \
-    --output-file "$TEMP_OUTPUT" 2>&1 | {
-        last=0
-        while IFS= read -r line; do
-            if [[ "$line" =~ progress[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
-                p="${BASH_REMATCH[1]}"
-                if   [ "$p" -ge 75 ] && [ "$last" -lt 75 ]; then notify "Transcribe" "Транскрибация… 75%"; last=75
-                elif [ "$p" -ge 50 ] && [ "$last" -lt 50 ]; then notify "Transcribe" "Транскрибация… 50%"; last=50
-                elif [ "$p" -ge 25 ] && [ "$last" -lt 25 ]; then notify "Transcribe" "Транскрибация… 25%"; last=25
-                fi
+mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="$TEMP_DIR"
+
+# --- Пингер прогресса: читает вывод движка, шлёт уведомления на 25/50/75% -----
+pipe_progress() {  # $1 — подпись движка; $2 — файл лога (весь вывод движка)
+    local last=0 line p
+    while IFS= read -r line; do
+        printf '%s\n' "$line" >> "$2"
+        if [[ "$line" =~ progress[[:space:]]*=[[:space:]]*([0-9]+) ]]; then
+            p="${BASH_REMATCH[1]}"
+            if   [ "$p" -ge 75 ] && [ "$last" -lt 75 ]; then notify "Transcribe" "$1… 75%"; last=75
+            elif [ "$p" -ge 50 ] && [ "$last" -lt 50 ]; then notify "Transcribe" "$1… 50%"; last=50
+            elif [ "$p" -ge 25 ] && [ "$last" -lt 25 ]; then notify "Transcribe" "$1… 25%"; last=25
             fi
-        done
-    }
-WHISPER_STATUS=${PIPESTATUS[0]}
+        fi
+    done
+}
 
-END_EPOCH=$(date +%s)
-ELAPSED=$((END_EPOCH - START_EPOCH))
-ELAPSED_FMT=$(fmt_hms "$ELAPSED")
-FINISH_REAL=$(date '+%Y-%m-%d %H:%M:%S')
+# --- Движки ------------------------------------------------------------------
+run_whisper() {  # результат в "$TEMP_WHISPER.txt" (+ .srt); код 0 = успех
+    : > "$LOG_DIR/last_whisper.log"
+    "${CAFFEINATE[@]}" "$WHISPER_BIN" \
+        -m "$MODEL_PATH" \
+        -f "$TEMP_AUDIO" \
+        -l "$LANG_CODE" \
+        "${QUALITY_ARGS[@]}" \
+        "${VAD_ARGS[@]}" \
+        "${TS_ARGS[@]}" \
+        --suppress-nst \
+        --print-progress \
+        --output-txt \
+        --output-file "$TEMP_WHISPER" 2>&1 | pipe_progress "Whisper" "$LOG_DIR/last_whisper.log"
+    local st=${PIPESTATUS[0]}
+    [ "$st" -eq 0 ] && [ -f "${TEMP_WHISPER}.txt" ]
+}
 
-# --- Обработка ошибки --------------------------------------------------------
-if [ "$WHISPER_STATUS" -ne 0 ] || [ ! -f "${TEMP_OUTPUT}.txt" ]; then
-    {
-        echo "$INPUT_NAME"
-        echo "Старт транскрибации: $START_HUMAN"
-        echo "❌ Ошибка: не удалось завершить транскрибацию (код $WHISPER_STATUS)."
-        echo "Попробуйте запустить ещё раз. Этот файл можно удалить."
-    } > "$PROGRESS_TXT" 2>/dev/null
-    notify "Ошибка транскрибации" "Не удалось транскрибировать $INPUT_NAME" "Basso"
-    exit 1
-fi
+run_gigaam() {  # результат в "$TEMP_GIGAAM.txt" (+ .srt, .meta); код 0 = успех
+    : > "$LOG_DIR/last_gigaam.log"
+    "${CAFFEINATE[@]}" "$GIGAAM_PY" "$GIGAAM_RUNNER" \
+        --wav "$TEMP_AUDIO" \
+        --out "$TEMP_GIGAAM" \
+        --models-dir "$GIGAAM_MODELS_DIR" \
+        --device "$GIGAAM_DEVICE" \
+        "${GIGAAM_SRT_ARGS[@]}" 2>&1 | pipe_progress "GigaAM" "$LOG_DIR/last_gigaam.log"
+    local st=${PIPESTATUS[0]}
+    [ "$st" -eq 0 ] && [ -f "${TEMP_GIGAAM}.txt" ]
+}
+
+# --- Пост-обработка вывода движка (.txt и .srt на месте) ---------------------
+# Междометия (STRIP_FILLERS) и галлюцинации Whisper (WHISPER_CLEANUP). На python3:
+# sed/awk на macOS считают байты и не дружат с кириллицей. Аргументы:
+# база временных файлов, движок, STRIP_FILLERS, WHISPER_CLEANUP.
+postprocess() {
+    if [ "$STRIP_FILLERS" != "1" ] && { [ "$2" != "whisper" ] || [ "$WHISPER_CLEANUP" != "1" ]; }; then
+        return 0
+    fi
+    command -v python3 >/dev/null 2>&1 || return 0
+    python3 - "$1" "$2" "$STRIP_FILLERS" "$WHISPER_CLEANUP" <<'PY' 2>/dev/null || true
+import os, re, sys
+
+base, engine = sys.argv[1], sys.argv[2]
+strip_fillers = sys.argv[3] == "1"
+cleanup = sys.argv[4] == "1" and engine == "whisper"
+
+# Междометия-растяжки, как их пишет GigaAM: «э-э», «а-а-а», «м-м», «и-и-и».
+FILLER = re.compile(r"(?<![\w-])[аэоуыиеёмнАЭОУЫИЕЁМН](?:-[аэоуыиеёмн])+(?![\w-])")
+# Титры и призывы из обучающих субтитров — Whisper дописывает их на тишине/в конце.
+JUNK = re.compile(
+    r"(редактор субтитров|корректор [а-яё]\.|субтитры\s+(сделал|создал|создавал|подготовил|делал|предоставил[аи]?|от|по)\b"
+    r"|продолжение следует|спасибо за просмотр|подписывайтесь на|ставьте лайк"
+    r"|subtitles by|thanks for watching|thank you for watching|amara\.org|dimatorzok)", re.I)
+
+# После «, э-э, » запятую оставляем только перед союзом/союзным словом («помним, э-э, что» →
+# «помним, что»); иначе обе запятые — от междометия («расхождения, м-м, по» → «расхождения по»).
+KEEP_COMMA = {"что", "чтобы", "который", "которая", "которое", "которые", "где", "когда", "если",
+              "потому", "поскольку", "хотя", "но", "а", "то", "как", "чем", "зачем", "почему",
+              "куда", "откуда", "пока", "так"}
+ENCLOSED = re.compile(r",\s*" + FILLER.pattern + r"\s*,\s*(?=(\S+))")
+
+def strip_fill(text):
+    lead = FILLER.match(text.lstrip())
+    lead_upper = bool(lead) and lead.group(0)[0].isupper()
+    out = ENCLOSED.sub(lambda m: ", " if m.group(1).lower().strip(",.!?;:") in KEEP_COMMA else " ", text)
+    out = FILLER.sub("", out)
+    out = re.sub(r",\s*,", ",", out)               # «новый, , реквизит» → «новый, реквизит»
+    out = re.sub(r"\s+([,.!?…;:])", r"\1", out)    # пробел перед знаком препинания
+    out = re.sub(r"[ \t]{2,}", " ", out).strip()
+    out = re.sub(r"^[,;:\s]+", "", out)
+    if lead_upper and out[:1].islower():           # междометие открывало фразу → заглавная
+        out = out[0].upper() + out[1:]
+    return out
+
+def is_junk(text):
+    return bool(JUNK.search(text)) and len(text.split()) <= 12
+
+class Filter:
+    def __init__(self, removed=None):
+        self.prev = None
+        self.removed = removed  # сюда складываем выброшенные титры (для .filtered.txt)
+    def __call__(self, text):
+        """Возвращает очищенный текст или None, если реплику надо выбросить."""
+        if strip_fillers:
+            text = strip_fill(text)
+        if not re.search(r"\w", text):                # пусто или одни знаки («Э-э.» → «.»)
+            return None
+        if cleanup:
+            if is_junk(text):
+                if self.removed is not None:
+                    self.removed.append(text)
+                return None
+            key = re.sub(r"\W+", " ", text).strip().lower()
+            if key and key == self.prev:           # петля-галлюцинация: одна строка подряд
+                return None
+            self.prev = key
+        return text
+
+txt = base + ".txt"
+if os.path.exists(txt):
+    with open(txt, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    removed = []
+    flt = Filter(removed)
+    kept = [t for t in (flt(l) for l in lines) if t is not None]
+    with open(txt, "w", encoding="utf-8") as f:
+        f.write("\n".join(kept) + ("\n" if kept else ""))
+    if removed:
+        with open(base + ".removed", "w", encoding="utf-8") as f:
+            f.write("\n".join(removed) + "\n")
+
+srt = base + ".srt"
+if os.path.exists(srt):
+    with open(srt, encoding="utf-8", errors="replace") as f:
+        content = f.read().strip()
+    flt, kept = Filter(), []
+    for block in re.split(r"\r?\n\r?\n", content):
+        ls = block.splitlines()
+        ti = next((i for i, l in enumerate(ls) if "-->" in l), None)
+        if ti is None:
+            continue
+        text = flt(" ".join(x.strip() for x in ls[ti + 1:] if x.strip()))
+        if text is not None:
+            kept.append((ls[ti].strip(), text))
+    with open(srt, "w", encoding="utf-8") as f:
+        for n, (timing, text) in enumerate(kept, 1):
+            f.write("%d\n%s\n%s\n\n" % (n, timing, text))
+PY
+}
 
 # --- Тело расшифровки --------------------------------------------------------
-TRANSCRIPT_BODY="${TEMP_OUTPUT}.body"
-SRT="${TEMP_OUTPUT}.srt"
-
 # FEAT-3: читаемый режим — абзацы по паузам + перенос строк. На python3, потому
 # что awk/fold на macOS считают байты и рвут кириллицу (UTF-8). Аргументы:
 # PARA_GAP WRAP_WIDTH USE_TIMESTAMPS SRT.
-format_readable() {
-    python3 - "$PARA_GAP" "$WRAP_WIDTH" "$USE_TIMESTAMPS" "$SRT" <<'PY'
+format_readable() {  # $1 — путь к .srt
+    python3 - "$PARA_GAP" "$WRAP_WIDTH" "$USE_TIMESTAMPS" "$1" <<'PY'
 import sys, re, textwrap
 
 gap     = float(sys.argv[1])
@@ -311,14 +589,15 @@ sys.stdout.write(("\n".join(out)).rstrip() + "\n")
 PY
 }
 
-build_body() {
-    if [ "$USE_READABLE" = "1" ] && [ -f "$SRT" ] && command -v python3 >/dev/null 2>&1; then
-        if format_readable > "$TRANSCRIPT_BODY" 2>/dev/null && [ -s "$TRANSCRIPT_BODY" ]; then
+build_body() {  # $1 — база временных файлов движка; тело расшифровки → "$1.body"
+    local srt="$1.srt" body="$1.body"
+    if [ "$USE_READABLE" = "1" ] && [ -f "$srt" ] && command -v python3 >/dev/null 2>&1; then
+        if format_readable "$srt" > "$body" 2>/dev/null && [ -s "$body" ]; then
             return
         fi
     fi
     # FEAT-1: только таймкоды — строки «[ЧЧ:ММ:СС] текст».
-    if [ "$USE_TIMESTAMPS" = "1" ] && [ -f "$SRT" ]; then
+    if [ "$USE_TIMESTAMPS" = "1" ] && [ -f "$srt" ]; then
         # prev — страховка от петель: подряд идущие идентичные реплики не дублируем.
         awk '
             function emit() { if (ts!="" && text!=prev) { print "[" ts "] " text; prev=text } ts=""; text="" }
@@ -327,7 +606,7 @@ build_body() {
             /^[[:space:]]*\r?$/  { emit(); next }
                                 { sub(/\r$/,""); text=(text=="" ? $0 : text " " $0) }
             END                 { emit() }
-        ' "$SRT" > "$TRANSCRIPT_BODY"
+        ' "$srt" > "$body"
         return
     fi
     # Обычная сплошная расшифровка. Схлопываем подряд идущие идентичные строки —
@@ -338,70 +617,105 @@ build_body() {
             line=$0; key=line; gsub(/^[[:space:]]+|[[:space:]]+$/, "", key)
             if (key == "" || key != prev) print line
             prev=key
-         }' "${TEMP_OUTPUT}.txt" > "$TRANSCRIPT_BODY"
+         }' "$1.txt" > "$body"
+    # Пустое тело (например, GigaAM не нашёл речи) — лучше явная пометка, чем пустой файл.
+    [ -s "$body" ] || echo "(речь не обнаружена)" > "$body"
 }
 
-build_body
+# Удалённые пост-обработкой титры-галлюцинации Whisper → «<имя>.filtered.txt» рядом с
+# исходником, чтобы можно было убедиться, что реальная речь не пострадала.
+# Выставляет FILTERED_NOTE — строку для шапки результата (пусто, если ничего не удалено).
+write_filtered_report() {  # $1 — база временных файлов движка
+    local n
+    FILTERED_NOTE=""
+    [ -s "$1.removed" ] || return 0
+    n=$(grep -c . "$1.removed" 2>/dev/null); n=${n:-0}
+    [ "$n" -gt 0 ] || return 0
+    {
+        echo "Отфильтровано как вероятные галлюцинации Whisper (титры/подписи на тишине)."
+        echo "Исходный файл: $INPUT_NAME · Дата: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "Если среди строк ниже есть реальная речь — сообщите, поправим фильтр (WHISPER_CLEANUP=0 отключает)."
+        echo "-----------------------------------------"
+        cat "$1.removed"
+    } > "$INPUT_DIR/${INPUT_NAME}.filtered.txt" 2>/dev/null
+    FILTERED_NOTE="Отфильтровано служебных строк (титры): $n → ${INPUT_NAME}.filtered.txt"
+}
 
-# --- Фильтр служебных «титров»-галлюцинаций Whisper --------------------------
-# Whisper (обучен в т.ч. на YouTube-субтитрах) на тишине/шуме/паузах выдумывает
-# подписи авторов субтитров: «Субтитры сделал DimaTorzok», «Amara.org»,
-# «Продолжение следует», «Спасибо за просмотр» и т.п. Вырезаем такие строки.
-# Что удалено — пишем рядом в «<имя>.filtered.txt» для сверки (чтобы убедиться,
-# что легитимный текст не пострадал). Отключить целиком: FILTER=0.
-# Паттерны — регистронезависимые «внутренние» подстроки (без опоры на grep -i,
-# который для кириллицы ненадёжен): «убтитр» ловит Субтитры/субтитров/… .
-FILTER="${FILTER:-1}"
-SUPPRESS_REGEX="${SUPPRESS_REGEX:-убтитр|DimaTorzok|mara\.org|родолжение следует|пасибо за просмотр}"
-FILTERED_COUNT=0
-if [ "$FILTER" = "1" ]; then
-    grep -vE "$SUPPRESS_REGEX" "$TRANSCRIPT_BODY" > "${TEMP_OUTPUT}.clean" 2>/dev/null || cp "$TRANSCRIPT_BODY" "${TEMP_OUTPUT}.clean"
-    grep -nE  "$SUPPRESS_REGEX" "$TRANSCRIPT_BODY" > "${TEMP_OUTPUT}.removed" 2>/dev/null || true
-    FILTERED_COUNT=$(grep -c . "${TEMP_OUTPUT}.removed" 2>/dev/null); FILTERED_COUNT=${FILTERED_COUNT:-0}
-    cp "${TEMP_OUTPUT}.clean" "$TRANSCRIPT_BODY"
-    if [ "$FILTERED_COUNT" -gt 0 ]; then
-        {
-            echo "Отфильтровано как вероятные галлюцинации Whisper (титры/подписи на тишине)."
-            echo "Исходный файл: $INPUT_NAME · Дата: $(date '+%Y-%m-%d %H:%M:%S')"
-            echo "Если среди строк ниже есть реальная речь — сообщите, поправим фильтр (FILTER=0 отключает)."
-            echo "-----------------------------------------"
-            cat "${TEMP_OUTPUT}.removed"
-        } > "$INPUT_DIR/${INPUT_NAME}.filtered.txt" 2>/dev/null
+write_result() {  # $1 база временных файлов, $2 итоговый файл, $3 подпись модели, $4 старт, $5 финиш, $6 длительность, [$7 доп. строка шапки]
+    build_body "$1"
+    {
+        echo "========================================="
+        echo "Исходный файл: $INPUT_NAME"
+        echo "Длительность аудио: $DURATION_FMT"
+        echo "Старт транскрибации: $4"
+        echo "Завершение транскрибации: $5"
+        echo "Время транскрибации: $6"
+        echo "Модель: $3"
+        [ -n "${7:-}" ] && echo "$7"
+        echo "========================================="
+        echo ""
+        cat "$1.body"
+    } > "$2"
+}
+
+# --- Запуск движков по очереди (оба грузят GPU/CPU — параллельно только мешали бы) ---
+FAILED=""; DONE_FILES=""
+
+if [ "$RUN_WHISPER" = "1" ]; then
+    W_START_EPOCH=$(date +%s); W_START_HUMAN=$(date '+%Y-%m-%d %H:%M:%S')
+    if run_whisper; then
+        W_ELAPSED=$(( $(date +%s) - W_START_EPOCH ))
+        postprocess "$TEMP_WHISPER" whisper
+        write_filtered_report "$TEMP_WHISPER"
+        write_result "$TEMP_WHISPER" "$OUTPUT_TXT" \
+            "$MODEL_LABEL (язык: $LANG_CODE, качество: $QUALITY)" \
+            "$W_START_HUMAN" "$(date '+%Y-%m-%d %H:%M:%S')" "$(fmt_hms "$W_ELAPSED")" \
+            "$FILTERED_NOTE"
+        update_factor "$STATE_FILE" "$DUR_INT" "$W_ELAPSED"
+        DONE_FILES="«${OUTPUT_NAME}»"
+        if [ "$RUN_GIGAAM" = "1" ]; then
+            notify "Transcribe" "Whisper готов за $(fmt_hms "$W_ELAPSED") — теперь GigaAM (~$(fmt_hms "$EST_GIGAAM"))"
+        fi
+    else
+        FAILED="Whisper"
     fi
 fi
 
-# --- Финальный файл с результатом --------------------------------------------
-{
-    echo "========================================="
-    echo "Исходный файл: $INPUT_NAME"
-    echo "Длительность аудио: $DURATION_FMT"
-    echo "Старт транскрибации: $START_HUMAN"
-    echo "Завершение транскрибации: $FINISH_REAL"
-    echo "Время транскрибации: $ELAPSED_FMT"
-    echo "Модель: $MODEL_LABEL (язык: $LANG_CODE, качество: $QUALITY)"
-    [ "${FILTERED_COUNT:-0}" -gt 0 ] && echo "Отфильтровано служебных строк (титры): $FILTERED_COUNT → ${INPUT_NAME}.filtered.txt"
-    echo "========================================="
-    echo ""
-    cat "$TRANSCRIPT_BODY"
-} > "$OUTPUT_TXT"
+if [ "$RUN_GIGAAM" = "1" ]; then
+    G_START_EPOCH=$(date +%s); G_START_HUMAN=$(date '+%Y-%m-%d %H:%M:%S')
+    if run_gigaam; then
+        G_ELAPSED=$(( $(date +%s) - G_START_EPOCH ))
+        postprocess "$TEMP_GIGAAM" gigaam
+        G_DEVICE=$(sed -n 's/^device=//p' "${TEMP_GIGAAM}.meta" 2>/dev/null)
+        write_result "$TEMP_GIGAAM" "$GIGAAM_OUTPUT_TXT" \
+            "$GIGAAM_LABEL (язык: ru, устройство: ${G_DEVICE:-?})" \
+            "$G_START_HUMAN" "$(date '+%Y-%m-%d %H:%M:%S')" "$(fmt_hms "$G_ELAPSED")"
+        update_factor "$GIGAAM_STATE_FILE" "$DUR_INT" "$G_ELAPSED"
+        DONE_FILES="${DONE_FILES:+$DONE_FILES, }«${GIGAAM_OUTPUT_NAME}»"
+    else
+        FAILED="${FAILED:+$FAILED, }GigaAM"
+    fi
+fi
+
+ELAPSED=$(( $(date +%s) - START_EPOCH ))
+ELAPSED_FMT=$(fmt_hms "$ELAPSED")
+
+# --- Обработка ошибки --------------------------------------------------------
+if [ -n "$FAILED" ]; then
+    {
+        echo "$INPUT_NAME"
+        echo "Старт транскрибации: $START_HUMAN"
+        echo "❌ Ошибка: не удалось завершить транскрибацию ($FAILED)."
+        [ -n "$DONE_FILES" ] && echo "✅ Готово: $DONE_FILES"
+        echo "Подробности: $LOG_DIR"
+        echo "Попробуйте запустить ещё раз. Этот файл можно удалить."
+    } > "$PROGRESS_TXT" 2>/dev/null
+    notify "Ошибка транскрибации" "$FAILED: не удалось транскрибировать $INPUT_NAME" "Basso"
+    exit 1
+fi
 
 # --- Удаляем файл-индикатор (best-effort) ------------------------------------
 rm -f "$PROGRESS_TXT" 2>/dev/null || true
 
-# --- Обновляем оценку скорости (только для файлов от 60 c) --------------------
-if [ "$DUR_INT" -ge 60 ] && [ "$ELAPSED" -gt 0 ]; then
-    RAW=$(awk -v d="$DUR_INT" -v e="$ELAPSED" 'BEGIN{printf "%.3f", d/e}')
-    OLD=""
-    [ -f "$STATE_FILE" ] && OLD=$(cat "$STATE_FILE" 2>/dev/null)
-    if [ -n "$OLD" ] && awk -v o="$OLD" -v r="$RAW" 'BEGIN{exit !(o+0>0 && r+0>0 && r < o/3)}'; then
-        : # Аномально медленный замер (в 3+ раза ниже выученного) — почти наверняка
-          # сон/прерывание во время распознавания. Не обновляем, чтобы не испортить оценку.
-    elif [ -n "$OLD" ] && awk -v o="$OLD" 'BEGIN{exit !(o+0>0)}'; then
-        awk -v o="$OLD" -v n="$RAW" 'BEGIN{printf "%.3f", 0.5*o+0.5*n}' > "$STATE_FILE" 2>/dev/null || true
-    else
-        echo "$RAW" > "$STATE_FILE" 2>/dev/null || true
-    fi
-fi
-
-notify "Готово ✅" "Готово за ${ELAPSED_FMT}: ${OUTPUT_NAME}" "Glass"
+notify "Готово ✅" "Готово за ${ELAPSED_FMT}: ${DONE_FILES}" "Glass"
 exit 0
