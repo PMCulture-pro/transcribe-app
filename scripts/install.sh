@@ -86,7 +86,17 @@ RAW_SCRIPTS_URL="https://raw.githubusercontent.com/PMCulture-pro/transcribe-app/
 GIGAAM_GIT="git+https://github.com/salute-developers/GigaAM.git@7447938d791c4f3e643386ee22c33777004293a5"
 GIGAAM_CDN="https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM"
 GIGAAM_CKPT_MD5="2730de7545ac43ad256485a462b0a27a"
-GIGAAM_SIZE="~1.5 GB"   # venv с PyTorch ~1 ГБ + модель 450 МБ
+GIGAAM_TOKENIZER_SHA256="828c12c991019eef952a960661f25a92d6ad279591e2ea466b4aeddf1d20a18a"
+GIGAAM_SIZE="~1.5 GB"   # venv с PyTorch ~1 ГБ + модель 450 МБ + спикеры ~35 МБ
+# Разметка спикеров (FEAT-5, ставится вместе с GigaAM в тот же venv): sherpa-onnx +
+# модели, что внутри pyannote/speaker-diarization-3.1, в ONNX (без токена Hugging Face).
+# Источник — релизы k2-fsa/sherpa-onnx на GitHub; версии и SHA256 закреплены.
+SHERPA_ONNX_PKG="sherpa-onnx==1.13.8"
+DIAR_SEG_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+DIAR_SEG_TAR_SHA256="24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488"
+DIAR_SEG_SHA256="220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079"
+DIAR_EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
+DIAR_EMB_SHA256="e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012"
 MODEL_SIZE="3.0 GB"
 FFMPEG_SIZE="95 MB"
 TOTAL_SIZE="3.1 GB"
@@ -125,6 +135,7 @@ echo ""
 if [ "${WITH_GIGAAM:-0}" = "1" ]; then
     echo "  ✓ GigaAM v3 E2E-RNN-T (Sber) - вторая AI модель: каждый файл распознаётся"
     echo "    двумя сетями, рядом появляются <имя>.txt (Whisper) и <имя>.gigaam.txt (GigaAM)"
+    echo "    + разметка спикеров (SPEAKERS=auto в файле настроек)"
     echo "    Размер: $GIGAAM_SIZE (Python-окружение с PyTorch + модель)"
     echo ""
     TOTAL_SIZE="4.6 GB"
@@ -420,10 +431,45 @@ install_gigaam() {
             echo -e "${YELLOW}⚠ Модель GigaAM не скачалась — будет скачана при первом запуске${NC}"
         fi
     fi
-    if [ ! -s "$tok" ]; then
-        curl -fsSL -o "$tok.part" "$GIGAAM_CDN/v3_e2e_rnnt_tokenizer.model" && mv "$tok.part" "$tok" || rm -f "$tok.part"
+    if ! { [ -s "$tok" ] && verify_sha "$tok" "$GIGAAM_TOKENIZER_SHA256"; }; then
+        if curl -fsSL -o "$tok.part" "$GIGAAM_CDN/v3_e2e_rnnt_tokenizer.model" \
+            && verify_sha "$tok.part" "$GIGAAM_TOKENIZER_SHA256"; then
+            mv "$tok.part" "$tok"
+        else
+            rm -f "$tok.part"
+            echo -e "${YELLOW}⚠ Токенизатор GigaAM не скачался или не прошёл проверку SHA256${NC}"
+        fi
     fi
+
+    # Разметка спикеров: ошибка здесь не валит GigaAM — просто SPEAKERS будет недоступен.
+    install_diarization || echo -e "${YELLOW}⚠ Разметка спикеров не установилась — GigaAM и Whisper работают без неё${NC}"
     return 0
+}
+
+install_diarization() {  # sherpa-onnx в venv GigaAM + модели сегментации и эмбеддингов (SHA256)
+    local dir="$MODEL_DIR/diarization" seg emb tar tmpd
+    seg="$dir/segmentation-3.0.onnx"
+    emb="$dir/wespeaker_en_voxceleb_resnet34_LM.onnx"
+    mkdir -p "$dir"
+    "$GIGAAM_VENV/bin/python" -m pip install -q "$SHERPA_ONNX_PKG" \
+        && "$GIGAAM_VENV/bin/python" -c 'import sherpa_onnx' || return 1
+    if ! { [ -f "$seg" ] && verify_sha "$seg" "$DIAR_SEG_SHA256"; }; then
+        tar="$dir/segmentation.tar.bz2"
+        tmpd="$dir/.seg"
+        curl -fsSL -o "$tar" "$DIAR_SEG_URL" && verify_sha "$tar" "$DIAR_SEG_TAR_SHA256" || { rm -f "$tar"; return 1; }
+        rm -rf "$tmpd" && mkdir -p "$tmpd" \
+            && tar -xjf "$tar" -C "$tmpd" sherpa-onnx-pyannote-segmentation-3-0/model.onnx \
+            && verify_sha "$tmpd/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" "$DIAR_SEG_SHA256" \
+            && mv -f "$tmpd/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" "$seg"
+        local rc=$?
+        rm -rf "$tmpd" "$tar"
+        [ "$rc" -eq 0 ] || return 1
+    fi
+    if ! { [ -f "$emb" ] && verify_sha "$emb" "$DIAR_EMB_SHA256"; }; then
+        curl -fsSL -o "$emb.part" "$DIAR_EMB_URL" && verify_sha "$emb.part" "$DIAR_EMB_SHA256" \
+            && mv -f "$emb.part" "$emb" || { rm -f "$emb.part"; return 1; }
+    fi
+    echo -e "${GREEN}✓ Разметка спикеров готова (pyannote segmentation-3.0 + WeSpeaker ResNet34-LM)${NC}"
 }
 
 if [ "${WITH_GIGAAM:-0}" = "1" ]; then
@@ -477,6 +523,7 @@ install_script() {  # $1 — имя файла из scripts/: локальная
 install_script transcribe.sh || exit 1
 # Раннер GigaAM ставим всегда (он маленький): venv можно доставить позже через WITH_GIGAAM=1.
 install_script gigaam_transcribe.py || echo -e "${YELLOW}⚠ gigaam_transcribe.py не получен — GigaAM будет недоступен${NC}"
+install_script diarize.py || echo -e "${YELLOW}⚠ diarize.py не получен — разметка спикеров будет недоступна${NC}"
 echo -e "${GREEN}✓ Скрипт транскрибации готов${NC}"
 
 # Файл настроек (язык, качество, таймкоды, движки) — шаблон создаётся один раз,

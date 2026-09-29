@@ -34,7 +34,7 @@ SETTINGS_FILE="$INSTALL_DIR/settings.txt"      # пользовательски�
 # записать в settings.txt. Приоритет: env из командной строки > файл > умолчания ниже.
 # Файл НЕ исполняется как shell: читаются только строки КЛЮЧ=значение с известными
 # ключами (опечатка или мусор в файле не сломают запуск).
-SETTING_KEYS="ENGINE MODEL TRANSCRIBE_LANG QUALITY VAD TIMESTAMPS READABLE PARA_GAP WRAP_WIDTH STRIP_FILLERS WHISPER_CLEANUP GIGAAM_DEVICE"
+SETTING_KEYS="ENGINE MODEL TRANSCRIBE_LANG QUALITY VAD TIMESTAMPS READABLE PARA_GAP WRAP_WIDTH STRIP_FILLERS WHISPER_CLEANUP GIGAAM_DEVICE SPEAKERS"
 
 write_settings_template() {  # создаёт шаблон, если файла ещё нет (существующий не трогаем)
     [ -e "$SETTINGS_FILE" ] && return 0
@@ -59,6 +59,10 @@ write_settings_template() {  # создаёт шаблон, если файла 
 
 # Таймкоды [ЧЧ:ММ:СС] в тексте: 0 | 1
 #TIMESTAMPS=0
+
+# Кто говорит — подписи «Спикер 1:», «Спикер 2:» (нужна установка с WITH_GIGAAM=1):
+# 0 — выкл | auto — число спикеров определить самому | 2, 3, … — точное число (надёжнее)
+#SPEAKERS=0
 
 # Разбивка на абзацы по паузам и перенос длинных строк: 0 | 1
 #READABLE=0
@@ -153,6 +157,12 @@ GIGAAM_MODELS_DIR="$INSTALL_DIR/models/gigaam"
 GIGAAM_STATE_FILE="$INSTALL_DIR/last_speed_factor_gigaam"
 GIGAAM_SEED_FACTOR="8.0"
 GIGAAM_LABEL="GigaAM v3 E2E-RNN-T"
+# FEAT-5: SPEAKERS — разметка по спикерам (диаризация). 0 — выкл (по умолчанию);
+#   auto — число спикеров определяется само; N — точное число (надёжнее, если известно).
+#   Работает в Python-окружении GigaAM (sherpa-onnx + модели pyannote-3.0/WeSpeaker).
+SPEAKERS="${SPEAKERS:-0}"
+DIARIZE_RUNNER="$INSTALL_DIR/bin/diarize.py"
+DIARIZE_MODELS_DIR="$INSTALL_DIR/models/diarization"
 
 # --- Уведомления (безопасно к кавычкам/спецсимволам в тексте) ----------------
 notify() {
@@ -212,6 +222,22 @@ if [ "$RUN_GIGAAM" = "1" ] && ! gigaam_available; then
     fi
 fi
 
+# --- Спикеры (FEAT-5) --------------------------------------------------------
+diarize_available() {
+    [ -x "$GIGAAM_PY" ] && [ -f "$DIARIZE_RUNNER" ] \
+        && [ -f "$DIARIZE_MODELS_DIR/segmentation-3.0.onnx" ] \
+        && [ -f "$DIARIZE_MODELS_DIR/wespeaker_en_voxceleb_resnet34_LM.onnx" ]
+}
+RUN_DIARIZE=0
+case "$SPEAKERS" in
+    0|"") ;;
+    *) if diarize_available; then
+           RUN_DIARIZE=1
+       else
+           notify "Transcribe" "Разметка спикеров не установлена — без спикеров (установка: WITH_GIGAAM=1)"
+       fi ;;
+esac
+
 # --- Выбор и поиск модели Whisper (переиспользуем уже скачанную) --------------
 case "$MODEL" in
     turbo) MODEL_FILE="ggml-large-v3-turbo.bin"; MODEL_LABEL="Whisper Large-v3-turbo" ;;
@@ -264,8 +290,9 @@ TEMP_DIR="${TMPDIR:-/tmp}"
 TEMP_AUDIO="$TEMP_DIR/transcribe_$$.wav"
 TEMP_WHISPER="$TEMP_DIR/transcribe_$$_whisper"   # база временных файлов Whisper (.txt/.srt/.body/.removed)
 TEMP_GIGAAM="$TEMP_DIR/transcribe_$$_gigaam"     # база временных файлов GigaAM (.txt/.srt/.body/.meta)
+TEMP_TURNS="$TEMP_DIR/transcribe_$$.turns"       # диаризация: начало<TAB>конец<TAB>спикер
 cleanup() {
-    rm -f "$TEMP_AUDIO"
+    rm -f "$TEMP_AUDIO" "$TEMP_TURNS"
     for b in "$TEMP_WHISPER" "$TEMP_GIGAAM"; do rm -f "$b.txt" "$b.srt" "$b.body" "$b.meta" "$b.removed" "$b.vad"; done
 }
 trap cleanup EXIT
@@ -319,7 +346,9 @@ update_factor() {  # $1 файл состояния, $2 длительность
 EST_WHISPER=0; EST_GIGAAM=0
 [ "$RUN_WHISPER" = "1" ] && EST_WHISPER=$(est_secs "$DUR_INT" "$(read_factor "$STATE_FILE" "$SEED_FACTOR")")
 [ "$RUN_GIGAAM" = "1" ]  && EST_GIGAAM=$(est_secs "$DUR_INT" "$(read_factor "$GIGAAM_STATE_FILE" "$GIGAAM_SEED_FACTOR")")
-EST_SECS=$((EST_WHISPER + EST_GIGAAM))
+EST_DIARIZE=0
+[ "$RUN_DIARIZE" = "1" ] && EST_DIARIZE=$(est_secs "$DUR_INT" 20)   # ~20× realtime на Apple Silicon
+EST_SECS=$((EST_WHISPER + EST_GIGAAM + EST_DIARIZE))
 EST_FMT=$(fmt_hms "$EST_SECS")
 
 START_EPOCH=$(date +%s)
@@ -333,6 +362,7 @@ if [ "$RUN_GIGAAM" = "1" ]; then
     ENGINES_LABEL="${ENGINES_LABEL:+$ENGINES_LABEL + }$GIGAAM_LABEL"
     EXPECTED_FILES="${EXPECTED_FILES:+$EXPECTED_FILES и }«${GIGAAM_OUTPUT_NAME}»"
 fi
+[ "$RUN_DIARIZE" = "1" ] && ENGINES_LABEL="$ENGINES_LABEL + спикеры"
 
 # --- Файл-индикатор "идёт транскрибация" -------------------------------------
 {
@@ -371,7 +401,7 @@ fi
 
 # .srt нужен и для таймкодов (FEAT-1), и для разбивки на абзацы по паузам (FEAT-3).
 TS_ARGS=(); GIGAAM_SRT_ARGS=()
-if [ "$USE_TIMESTAMPS" = "1" ] || [ "$USE_READABLE" = "1" ]; then
+if [ "$USE_TIMESTAMPS" = "1" ] || [ "$USE_READABLE" = "1" ] || [ "$RUN_DIARIZE" = "1" ]; then
     TS_ARGS=(--output-srt)
     GIGAAM_SRT_ARGS=(--srt)
 fi
@@ -423,9 +453,21 @@ run_gigaam() {  # результат в "$TEMP_GIGAAM.txt" (+ .srt, .meta); ко
         --out "$TEMP_GIGAAM" \
         --models-dir "$GIGAAM_MODELS_DIR" \
         --device "$GIGAAM_DEVICE" \
+        "${GIGAAM_TURNS_ARGS[@]}" \
         "${GIGAAM_SRT_ARGS[@]}" 2>&1 | pipe_progress "GigaAM" "$LOG_DIR/last_gigaam.log"
     local st=${PIPESTATUS[0]}
     [ "$st" -eq 0 ] && [ -f "${TEMP_GIGAAM}.txt" ]
+}
+
+run_diarize() {  # результат в "$TEMP_TURNS"; код 0 = успех
+    : > "$LOG_DIR/last_diarize.log"
+    "${CAFFEINATE[@]}" "$GIGAAM_PY" "$DIARIZE_RUNNER" \
+        --wav "$TEMP_AUDIO" \
+        --out "$TEMP_TURNS" \
+        --models-dir "$DIARIZE_MODELS_DIR" \
+        --speakers "$SPEAKERS" 2>&1 | pipe_progress "Спикеры" "$LOG_DIR/last_diarize.log"
+    local st=${PIPESTATUS[0]}
+    [ "$st" -eq 0 ] && [ -s "$TEMP_TURNS" ]
 }
 
 # --- Пост-обработка вывода движка (.txt и .srt на месте) ---------------------
@@ -660,8 +702,89 @@ sys.stdout.write(("\n".join(out)).rstrip() + "\n")
 PY
 }
 
+# FEAT-5: расшифровка по спикерам. Каждой реплике .srt назначается спикер с наибольшим
+# перекрытием по времени (диаризация одна на оба движка); подряд идущие реплики одного
+# спикера — один абзац «Спикер N: …», новый абзац также после паузы > PARA_GAP.
+# С TIMESTAMPS — таймкод в начале абзаца, с READABLE — перенос строк. Аргументы:
+# PARA_GAP WRAP_WIDTH USE_TIMESTAMPS USE_READABLE SRT TURNS.
+format_speakers() {  # $1 — путь к .srt
+    python3 - "$PARA_GAP" "$WRAP_WIDTH" "$USE_TIMESTAMPS" "$USE_READABLE" "$1" "$TEMP_TURNS" <<'PY'
+import re, sys, textwrap
+
+gap, width = float(sys.argv[1]), int(sys.argv[2])
+want_ts, readable = sys.argv[3] == "1", sys.argv[4] == "1"
+srt_path, turns_path = sys.argv[5], sys.argv[6]
+
+def tosec(t):
+    h, m, rest = t.strip().split()[0].split(":")
+    return int(h) * 3600 + int(m) * 60 + float(rest.replace(",", "."))
+
+turns = []
+for line in open(turns_path, encoding="utf-8"):
+    p = line.split("\t")
+    if len(p) >= 3:
+        turns.append((float(p[0]), float(p[1]), p[2].strip()))
+
+cues = []
+for block in re.split(r"\r?\n\r?\n", open(srt_path, encoding="utf-8", errors="replace").read().strip()):
+    ls = block.splitlines()
+    ti = next((i for i, l in enumerate(ls) if "-->" in l), None)
+    if ti is None:
+        continue
+    a, b = ls[ti].split("-->")
+    text = " ".join(x.strip() for x in ls[ti + 1:] if x.strip())
+    if text:
+        cues.append((tosec(a), tosec(b), text))
+
+def speaker_of(start, end, prev):
+    best, best_ov = None, 0.0
+    for s, e, spk in turns:
+        ov = min(end, e) - max(start, s)
+        if ov > best_ov:
+            best, best_ov = spk, ov
+    if best is None:  # реплика в «дыре» диаризации — ближайший по времени спикер
+        near = min(turns, key=lambda t: min(abs(t[0] - end), abs(t[1] - start)), default=None)
+        best = near[2] if near else prev
+    return best
+
+paras, prev_spk, prev_end = [], None, None
+for start, end, text in cues:
+    spk = speaker_of(start, end, prev_spk)
+    same = bool(paras) and spk == prev_spk
+    if same and text.strip().lower() == paras[-1][2][-1].strip().lower():
+        pass  # петля-галлюцинация: та же реплика подряд
+    elif same and (start - prev_end) <= gap:
+        paras[-1][2].append(text)
+    else:
+        paras.append((start, spk, [text]))
+    prev_spk, prev_end = spk, end
+
+def hms(sec):
+    sec = int(sec)
+    return "%02d:%02d:%02d" % (sec // 3600, (sec // 60) % 60, sec % 60)
+
+out = []
+for start, spk, texts in paras:
+    prefix = ("[%s] " % hms(start) if want_ts else "") + ("Спикер %s: " % spk if spk else "")
+    body = " ".join(texts)
+    if readable:
+        out.append(textwrap.fill(body, width=width, initial_indent=prefix,
+                                 subsequent_indent=" " * (len(prefix) if want_ts else 0),
+                                 break_long_words=False, break_on_hyphens=False))
+        out.append("")
+    else:
+        out.append(prefix + body)
+sys.stdout.write(("\n".join(out)).rstrip() + "\n")
+PY
+}
+
 build_body() {  # $1 — база временных файлов движка; тело расшифровки → "$1.body"
     local srt="$1.srt" body="$1.body"
+    if [ "$RUN_DIARIZE" = "1" ] && [ -s "$TEMP_TURNS" ] && [ -f "$srt" ] && command -v python3 >/dev/null 2>&1; then
+        if format_speakers "$srt" > "$body" 2>/dev/null && [ -s "$body" ]; then
+            return
+        fi
+    fi
     if [ "$USE_READABLE" = "1" ] && [ -f "$srt" ] && command -v python3 >/dev/null 2>&1; then
         if format_readable "$srt" > "$body" 2>/dev/null && [ -s "$body" ]; then
             return
@@ -712,7 +835,7 @@ write_filtered_report() {  # $1 — база временных файлов д�
     FILTERED_NOTE="Отфильтровано служебных строк (титры): $n → ${INPUT_NAME}.filtered.txt"
 }
 
-write_result() {  # $1 база временных файлов, $2 итоговый файл, $3 подпись модели, $4 старт, $5 финиш, $6 длительность, [$7 доп. строка шапки]
+write_result() {  # $1 база временных файлов, $2 итоговый файл, $3 подпись модели, $4 старт, $5 финиш, $6 длительность, [$7 $8 доп. строки шапки]
     build_body "$1"
     {
         echo "========================================="
@@ -723,6 +846,7 @@ write_result() {  # $1 база временных файлов, $2 итогов
         echo "Время транскрибации: $6"
         echo "Модель: $3"
         [ -n "${7:-}" ] && echo "$7"
+        [ -n "${8:-}" ] && echo "$8"
         echo "========================================="
         echo ""
         cat "$1.body"
@@ -730,7 +854,20 @@ write_result() {  # $1 база временных файлов, $2 итогов
 }
 
 # --- Запуск движков по очереди (оба грузят GPU/CPU — параллельно только мешали бы) ---
-FAILED=""; DONE_FILES=""
+FAILED=""; DONE_FILES=""; SPEAKERS_NOTE=""
+
+# Диаризация — первой и один раз на оба движка: GigaAM режет чанки по смене спикера.
+GIGAAM_TURNS_ARGS=()
+if [ "$RUN_DIARIZE" = "1" ]; then
+    if run_diarize; then
+        N_SPK=$(cut -f3 "$TEMP_TURNS" | sort -u | grep -c .)
+        SPEAKERS_NOTE="Спикеры: $N_SPK (SPEAKERS=$SPEAKERS; нумерация по порядку появления в записи)"
+        GIGAAM_TURNS_ARGS=(--turns "$TEMP_TURNS")
+    else
+        RUN_DIARIZE=0
+        notify "Transcribe" "Не удалось разметить спикеров — расшифровка без них (лог: $LOG_DIR)"
+    fi
+fi
 
 if [ "$RUN_WHISPER" = "1" ]; then
     W_START_EPOCH=$(date +%s); W_START_HUMAN=$(date '+%Y-%m-%d %H:%M:%S')
@@ -742,7 +879,7 @@ if [ "$RUN_WHISPER" = "1" ]; then
         write_result "$TEMP_WHISPER" "$OUTPUT_TXT" \
             "$MODEL_LABEL (язык: $LANG_CODE, качество: $QUALITY)" \
             "$W_START_HUMAN" "$(date '+%Y-%m-%d %H:%M:%S')" "$(fmt_hms "$W_ELAPSED")" \
-            "$FILTERED_NOTE"
+            "$FILTERED_NOTE" "$SPEAKERS_NOTE"
         update_factor "$STATE_FILE" "$DUR_INT" "$W_ELAPSED"
         DONE_FILES="«${OUTPUT_NAME}»"
         if [ "$RUN_GIGAAM" = "1" ]; then
@@ -761,7 +898,8 @@ if [ "$RUN_GIGAAM" = "1" ]; then
         G_DEVICE=$(sed -n 's/^device=//p' "${TEMP_GIGAAM}.meta" 2>/dev/null)
         write_result "$TEMP_GIGAAM" "$GIGAAM_OUTPUT_TXT" \
             "$GIGAAM_LABEL (язык: ru, устройство: ${G_DEVICE:-?})" \
-            "$G_START_HUMAN" "$(date '+%Y-%m-%d %H:%M:%S')" "$(fmt_hms "$G_ELAPSED")"
+            "$G_START_HUMAN" "$(date '+%Y-%m-%d %H:%M:%S')" "$(fmt_hms "$G_ELAPSED")" \
+            "" "$SPEAKERS_NOTE"
         update_factor "$GIGAAM_STATE_FILE" "$DUR_INT" "$G_ELAPSED"
         DONE_FILES="${DONE_FILES:+$DONE_FILES, }«${GIGAAM_OUTPUT_NAME}»"
     else

@@ -8,6 +8,7 @@ gigaam_transcribe.py — распознавание WAV (16 кГц, моно) м
     python gigaam_transcribe.py --wav in.wav --out /tmp/base [--srt]
                                 [--device auto|mps|cpu] [--model v3_e2e_rnnt]
                                 [--models-dir DIR] [--batch-size N]
+                                [--turns turns.tsv] [--max-gap SEC]
 
 Пишет:
     <out>.txt  — расшифровка, одна реплика (VAD-чанк) в строке;
@@ -19,6 +20,11 @@ gigaam_transcribe.py — распознавание WAV (16 кГц, моно) м
 .transcribe_longform() требует pyannote.audio и токен Hugging Face. Здесь речь режется
 Silero VAD (веса лежат внутри pip-пакета, токен не нужен) на чанки ≤ 22 с и распознаётся
 пачками — та же схема, что внутри transcribe_longform, но без внешних зависимостей.
+
+Для таймкодов и спикеров (--srt) чанк дополнительно закрывается на паузе длиннее --max-gap
+(иначе реплики через паузу получали бы один таймкод на 15–22 с) и на смене спикера из
+--turns (вывод diarize.py) — так каждый чанк принадлежит одному спикеру, а склейка фраз
+через смену спикера не делается.
 """
 import argparse
 import logging
@@ -82,33 +88,79 @@ def speech_regions(wav):
     return [(t["start"] / SR, t["end"] / SR) for t in stamps]
 
 
-def merge_regions(regions):
-    """Склеиваем речевые участки в чанки: охват ≤ MAX_CHUNK_S, по возможности ≥ MIN_CHUNK_S."""
+def load_turns(path):
+    """[(start, end, speaker), …] из TSV diarize.py; пустой список, если файла нет."""
+    turns = []
+    if path and os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    turns.append((float(parts[0]), float(parts[1]), parts[2].strip()))
+    return sorted(turns)
+
+
+def speaker_cuts(turns):
+    """Моменты смены спикера: середина между концом реплики и началом реплики другого спикера."""
+    cuts = []
+    for (s1, e1, a), (s2, _, b) in zip(turns, turns[1:]):
+        if a != b:
+            cuts.append((min(e1, s2) + max(e1, s2)) / 2)
+    return cuts
+
+
+def split_at(regions, cuts):
+    """Режем речевые участки в точках смены спикера; отмечаем, что после разреза — новый спикер."""
+    out = []  # (start, end, starts_new_speaker)
+    for start, end in regions:
+        inner = [c for c in cuts if start < c < end]
+        edges = [start] + inner + [end]
+        for i, (a, b) in enumerate(zip(edges, edges[1:])):
+            if b - a >= 0.05:
+                out.append((a, b, i > 0))
+    # участок, перед которым (в паузе) была смена спикера, тоже начинает нового спикера
+    res, prev_end = [], None
+    for a, b, cut in out:
+        if not cut and prev_end is not None and any(prev_end <= c <= a for c in cuts):
+            cut = True
+        res.append((a, b, cut))
+        prev_end = b
+    return res
+
+
+def merge_regions(regions, cuts=(), max_gap=None):
+    """Склеиваем речевые участки в чанки: охват ≤ MAX_CHUNK_S, по возможности ≥ MIN_CHUNK_S.
+
+    Чанк закрывается также на смене спикера (cuts) и на паузе > max_gap (если задано).
+    Возвращает [(start, end, starts_new_speaker), …].
+    """
     chunks = []
     cur_start = cur_end = None
-    for start, end in regions:
+    cur_cut = False
+    for start, end, cut in split_at(regions, list(cuts)):
         if cur_start is None:
-            cur_start, cur_end = start, end
+            cur_start, cur_end, cur_cut = start, end, cut
             continue
-        if (end - cur_start) > MAX_CHUNK_S or (cur_end - cur_start) > MIN_CHUNK_S:
-            chunks.append((cur_start, cur_end))
-            cur_start = start
+        long_pause = max_gap is not None and (start - cur_end) > max_gap
+        if cut or long_pause or (end - cur_start) > MAX_CHUNK_S or (cur_end - cur_start) > MIN_CHUNK_S:
+            chunks.append((cur_start, cur_end, cur_cut))
+            cur_start, cur_cut = start, cut
         cur_end = end
     if cur_start is not None:
-        chunks.append((cur_start, cur_end))
+        chunks.append((cur_start, cur_end, cur_cut))
 
     out = []  # страховка: чанк длиннее HARD_LIMIT_S делим поровну
-    for start, end in chunks:
+    for start, end, cut in chunks:
         parts = math.ceil((end - start) / MAX_CHUNK_S) if (end - start) > HARD_LIMIT_S else 1
         step = (end - start) / parts
-        out.extend((start + i * step, start + (i + 1) * step) for i in range(parts))
+        out.extend((start + i * step, start + (i + 1) * step, cut and i == 0) for i in range(parts))
     return out
 
 
 def fixed_windows(total_s):
     n = max(1, math.ceil(total_s / MAX_CHUNK_S))
     step = total_s / n
-    return [(i * step, (i + 1) * step) for i in range(n)]
+    return [(i * step, (i + 1) * step, False) for i in range(n)]
 
 
 # --- Модель ------------------------------------------------------------------
@@ -166,11 +218,12 @@ def is_finished(text):
 def heal_boundaries(chunks, texts, max_gap=1.5):
     """[(chunk, text, is_continuation), …] — пустые чанки выбрасываются."""
     items, prev_text, prev_end = [], None, None
-    for (start, end), text in zip(chunks, texts):
+    for (start, end, new_speaker), text in zip(chunks, texts):
         if not text:
             continue
         cont = False
-        if prev_text is not None and (start - prev_end) <= max_gap and not is_finished(prev_text):
+        if (prev_text is not None and not new_speaker and (start - prev_end) <= max_gap
+                and not is_finished(prev_text)):
             text = re.sub(r"^(?:\.{2,}|…)\s*", "", text)
             first = text.split()[0] if text.split() else ""
             # Заглавную снимаем, если это не аббревиатура вроде «НСИ»/«CRM».
@@ -223,6 +276,9 @@ def main():
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--fp16", action="store_true", help="fp16-энкодер на GPU (по умолчанию fp32)")
     ap.add_argument("--no-heal", action="store_true", help="не склеивать фразы, разорванные границей чанка")
+    ap.add_argument("--turns", help="TSV диаризации (diarize.py): резать чанки на смене спикера")
+    ap.add_argument("--max-gap", type=float, default=1.0,
+                    help="с --srt: закрывать чанк на паузе длиннее (сек), чтобы таймкоды были по репликам")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -230,10 +286,15 @@ def main():
     total_s = wav.numel() / SR
 
     regions = speech_regions(wav)
+    turns = load_turns(args.turns)
+    cuts = speaker_cuts(turns)
     if regions is None:
-        chunks, vad_kind = fixed_windows(total_s), "windows"
+        # без VAD режем окнами, но смену спикера всё равно учитываем
+        regions = [(s, e) for s, e, _ in fixed_windows(total_s)]
+        vad_kind = "windows"
     else:
-        chunks, vad_kind = merge_regions(regions), "silero"
+        vad_kind = "silero"
+    chunks = merge_regions(regions, cuts, args.max_gap if args.srt else None)
     log("аудио %.1f с → %d чанков (%s), VAD %.1f с" % (total_s, len(chunks), vad_kind, time.time() - t0))
 
     device = pick_device(args.device)
@@ -258,7 +319,7 @@ def main():
 
     elapsed = time.time() - t0
     if args.no_heal:
-        items = [(c, t, False) for c, t in zip(chunks, texts) if t]
+        items = [((c[0], c[1]), t, False) for c, t in zip(chunks, texts) if t]
     else:
         items = heal_boundaries(chunks, texts)
     healed = sum(1 for _, _, cont in items if cont)
