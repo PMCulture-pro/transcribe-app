@@ -77,9 +77,26 @@ WHISPER_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggm
 VAD_MODEL_URL="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"
 # Turbo-модель (~1.6 ГБ) — опционально, для MODEL=turbo (~3× быстрее large-v3).
 TURBO_MODEL_URL="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"
-# Канонический transcribe.sh — единый источник правды. Установщик копирует
-# соседний файл при запуске из клона репозитория, иначе докачивает по этому URL.
-TRANSCRIBE_RAW_URL="https://raw.githubusercontent.com/PMCulture-pro/transcribe-app/main/scripts/transcribe.sh"
+# Канонические скрипты (transcribe.sh, gigaam_transcribe.py) — единый источник правды.
+# Установщик копирует соседние файлы при запуске из клона репозитория, иначе докачивает по URL.
+RAW_SCRIPTS_URL="https://raw.githubusercontent.com/PMCulture-pro/transcribe-app/main/scripts"
+# GigaAM v3 E2E-RNN-T (опционально, WITH_GIGAAM=1) — вторая нейросеть для двойной
+# расшифровки. Пакет ставится с GitHub (на PyPI лежит устаревшая 0.1.0 под torch ≤ 2.5)
+# и закреплён на коммите; веса — с CDN Sber, md5 — из gigaam/__init__.py (_MODEL_HASHES).
+GIGAAM_GIT="git+https://github.com/salute-developers/GigaAM.git@7447938d791c4f3e643386ee22c33777004293a5"
+GIGAAM_CDN="https://cdn.chatwm.opensmodel.sberdevices.ru/GigaAM"
+GIGAAM_CKPT_MD5="2730de7545ac43ad256485a462b0a27a"
+GIGAAM_TOKENIZER_SHA256="828c12c991019eef952a960661f25a92d6ad279591e2ea466b4aeddf1d20a18a"
+GIGAAM_SIZE="~1.5 GB"   # venv с PyTorch ~1 ГБ + модель 450 МБ + спикеры ~35 МБ
+# Разметка спикеров (FEAT-5, ставится вместе с GigaAM в тот же venv): sherpa-onnx +
+# модели, что внутри pyannote/speaker-diarization-3.1, в ONNX (без токена Hugging Face).
+# Источник — релизы k2-fsa/sherpa-onnx на GitHub; версии и SHA256 закреплены.
+SHERPA_ONNX_PKG="sherpa-onnx==1.13.8"
+DIAR_SEG_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-segmentation-models/sherpa-onnx-pyannote-segmentation-3-0.tar.bz2"
+DIAR_SEG_TAR_SHA256="24615ee884c897d9d2ba09bb4d30da6bb1b15e685065962db5b02e76e4996488"
+DIAR_SEG_SHA256="220ad67ca923bef2fa91f2390c786097bf305bceb5e261d4af67b38e938e1079"
+DIAR_EMB_URL="https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/wespeaker_en_voxceleb_resnet34_LM.onnx"
+DIAR_EMB_SHA256="e9848563da86f263117134dfd7ad63c92355b37de492b55e325400c9d9c39012"
 MODEL_SIZE="3.0 GB"
 FFMPEG_SIZE="95 MB"
 TOTAL_SIZE="3.1 GB"
@@ -115,6 +132,14 @@ echo ""
 echo "  ✓ Quick Action - Интеграция в контекстное меню Finder"
 echo "    Размер: <1 MB"
 echo ""
+if [ "${WITH_GIGAAM:-0}" = "1" ]; then
+    echo "  ✓ GigaAM v3 E2E-RNN-T (Sber) - вторая AI модель: каждый файл распознаётся"
+    echo "    двумя сетями, рядом появляются <имя>.whisper.txt и <имя>.gigaam.txt"
+    echo "    + разметка спикеров (SPEAKERS=auto в файле настроек)"
+    echo "    Размер: $GIGAAM_SIZE (Python-окружение с PyTorch + модель)"
+    echo ""
+    TOTAL_SIZE="4.6 GB"
+fi
 echo -e "${YELLOW}╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌${NC}"
 echo -e "${GREEN}Общий объем загрузки: ~$TOTAL_SIZE${NC}"
 echo -e "${GREEN}Время установки: ~10-15 минут (зависит от скорости интернета)${NC}"
@@ -346,29 +371,166 @@ else
 fi
 echo ""
 
+# --- GigaAM v3 E2E-RNN-T (опционально; только при WITH_GIGAAM=1) --------------
+# Вторая нейросеть для двойной расшифровки одного файла (ENGINE=auto/both в
+# transcribe.sh): Python-venv с PyTorch, GigaAM и Silero VAD в $INSTALL_DIR/gigaam,
+# веса модели — в $MODEL_DIR/gigaam (всё внутри папки приложения — деинсталлятор
+# снесёт целиком). Ошибки здесь НЕ валят установку: Whisper остаётся рабочим, GigaAM
+# можно доставить повторным запуском с WITH_GIGAAM=1. См. BACKLOG FEAT-6.
+GIGAAM_VENV="$INSTALL_DIR/gigaam/venv"
+GIGAAM_MODELS_DIR="$MODEL_DIR/gigaam"
+GIGAAM_STATUS="skipped"   # skipped | ok | failed
+
+md5_of() { md5 -q "$1" 2>/dev/null || openssl md5 -r "$1" 2>/dev/null | cut -d' ' -f1; }
+
+find_python() {  # первый Python 3.10–3.13 с venv+ensurepip (под них есть колёса torch и onnxruntime)
+    local c p
+    for c in python3.12 python3.11 python3.13 python3.10 python3; do
+        p="$(command -v "$c" 2>/dev/null)" || continue
+        if "$p" -c 'import sys, venv, ensurepip; sys.exit(0 if (3, 10) <= sys.version_info[:2] <= (3, 13) else 1)' 2>/dev/null; then
+            printf '%s\n' "$p"; return 0
+        fi
+    done
+    return 1
+}
+
+install_gigaam() {
+    local py ckpt tok
+    if ! py="$(find_python)"; then
+        echo "  Python 3.10–3.13 не найден — устанавливаю python@3.12 через Homebrew..."
+        brew install -q python@3.12 || return 1
+        py="$(brew --prefix python@3.12)/bin/python3.12"
+    fi
+    echo "  Python: $py"
+    if [ ! -x "$GIGAAM_VENV/bin/python" ]; then
+        "$py" -m venv "$GIGAAM_VENV" || return 1
+    fi
+    start_heartbeat "  Установка PyTorch + GigaAM + Silero VAD (~1 ГБ)"
+    "$GIGAAM_VENV/bin/python" -m pip install -q --upgrade pip \
+        && "$GIGAAM_VENV/bin/python" -m pip install -q "torch>=2.6" "torchaudio>=2.6" "silero-vad" "gigaam @ $GIGAAM_GIT" \
+        && "$GIGAAM_VENV/bin/python" -c 'import torch, gigaam, silero_vad'
+    local rc=$?
+    stop_background_progress
+    echo ""
+    [ "$rc" -eq 0 ] || return 1
+    echo -e "${GREEN}✓ Python-окружение GigaAM готово${NC}"
+
+    # Веса модели (450 МБ) — с докачкой и проверкой md5, чтобы первый запуск из Finder
+    # не висел на скачивании. Не скачались — не страшно: раннер докачает при первом запуске.
+    mkdir -p "$GIGAAM_MODELS_DIR"
+    ckpt="$GIGAAM_MODELS_DIR/v3_e2e_rnnt.ckpt"
+    tok="$GIGAAM_MODELS_DIR/v3_e2e_rnnt_tokenizer.model"
+    if [ -f "$ckpt" ] && [ "$(md5_of "$ckpt")" = "$GIGAAM_CKPT_MD5" ]; then
+        echo -e "${GREEN}✓ Модель GigaAM уже скачана и проверена${NC}"
+    else
+        echo "  Скачиваю модель GigaAM v3 E2E-RNN-T (450 МБ)..."
+        if curl -fL -C - -# -o "$ckpt" "$GIGAAM_CDN/v3_e2e_rnnt.ckpt" && [ "$(md5_of "$ckpt")" = "$GIGAAM_CKPT_MD5" ]; then
+            echo -e "${GREEN}✓ Модель GigaAM скачана (md5 совпадает)${NC}"
+        else
+            rm -f "$ckpt"
+            echo -e "${YELLOW}⚠ Модель GigaAM не скачалась — будет скачана при первом запуске${NC}"
+        fi
+    fi
+    if ! { [ -s "$tok" ] && verify_sha "$tok" "$GIGAAM_TOKENIZER_SHA256"; }; then
+        if curl -fsSL -o "$tok.part" "$GIGAAM_CDN/v3_e2e_rnnt_tokenizer.model" \
+            && verify_sha "$tok.part" "$GIGAAM_TOKENIZER_SHA256"; then
+            mv "$tok.part" "$tok"
+        else
+            rm -f "$tok.part"
+            echo -e "${YELLOW}⚠ Токенизатор GigaAM не скачался или не прошёл проверку SHA256${NC}"
+        fi
+    fi
+
+    # Разметка спикеров: ошибка здесь не валит GigaAM — просто SPEAKERS будет недоступен.
+    install_diarization || echo -e "${YELLOW}⚠ Разметка спикеров не установилась — GigaAM и Whisper работают без неё${NC}"
+    return 0
+}
+
+install_diarization() {  # sherpa-onnx в venv GigaAM + модели сегментации и эмбеддингов (SHA256)
+    local dir="$MODEL_DIR/diarization" seg emb tar tmpd
+    seg="$dir/segmentation-3.0.onnx"
+    emb="$dir/wespeaker_en_voxceleb_resnet34_LM.onnx"
+    mkdir -p "$dir"
+    "$GIGAAM_VENV/bin/python" -m pip install -q "$SHERPA_ONNX_PKG" \
+        && "$GIGAAM_VENV/bin/python" -c 'import sherpa_onnx' || return 1
+    if ! { [ -f "$seg" ] && verify_sha "$seg" "$DIAR_SEG_SHA256"; }; then
+        tar="$dir/segmentation.tar.bz2"
+        tmpd="$dir/.seg"
+        curl -fsSL -o "$tar" "$DIAR_SEG_URL" && verify_sha "$tar" "$DIAR_SEG_TAR_SHA256" || { rm -f "$tar"; return 1; }
+        rm -rf "$tmpd" && mkdir -p "$tmpd" \
+            && tar -xjf "$tar" -C "$tmpd" sherpa-onnx-pyannote-segmentation-3-0/model.onnx \
+            && verify_sha "$tmpd/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" "$DIAR_SEG_SHA256" \
+            && mv -f "$tmpd/sherpa-onnx-pyannote-segmentation-3-0/model.onnx" "$seg"
+        local rc=$?
+        rm -rf "$tmpd" "$tar"
+        [ "$rc" -eq 0 ] || return 1
+    fi
+    if ! { [ -f "$emb" ] && verify_sha "$emb" "$DIAR_EMB_SHA256"; }; then
+        curl -fsSL -o "$emb.part" "$DIAR_EMB_URL" && verify_sha "$emb.part" "$DIAR_EMB_SHA256" \
+            && mv -f "$emb.part" "$emb" || { rm -f "$emb.part"; return 1; }
+    fi
+    echo -e "${GREEN}✓ Разметка спикеров готова (pyannote segmentation-3.0 + WeSpeaker ResNet34-LM)${NC}"
+}
+
+if [ "${WITH_GIGAAM:-0}" = "1" ]; then
+    echo "  Устанавливаю GigaAM v3 E2E-RNN-T (вторая нейросеть, $GIGAAM_SIZE)..."
+    if install_gigaam; then
+        GIGAAM_STATUS="ok"
+        echo -e "${GREEN}✓ GigaAM установлен — каждый файл будет распознан двумя сетями${NC}"
+    else
+        GIGAAM_STATUS="failed"
+        echo -e "${YELLOW}⚠ GigaAM не установился — Whisper работает как обычно.${NC}"
+        echo -e "${YELLOW}  Повторить: WITH_GIGAAM=1 bash install.sh${NC}"
+    fi
+elif [ -x "$GIGAAM_VENV/bin/python" ]; then
+    GIGAAM_STATUS="ok"
+    echo -e "${GREEN}✓ GigaAM уже установлен${NC}"
+else
+    echo -e "${BLUE}ℹ GigaAM пропущен. Для двойной расшифровки (Whisper + GigaAM v3): переустановить с WITH_GIGAAM=1${NC}"
+fi
+echo ""
+
 # Создание скрипта транскрибации
 echo -e "${BLUE}[5/5]${NC} Настройка транскрибатора..."
 
-# scripts/transcribe.sh — единый источник правды (раньше дублировался здесь
-# heredoc'ом и молча расходился с репозиторием). При запуске установщика из
-# клона копируем соседний файл; иначе докачиваем из репозитория. См. BACKLOG MNT-1.
+# scripts/transcribe.sh и scripts/gigaam_transcribe.py — единый источник правды
+# (раньше transcribe.sh дублировался здесь heredoc'ом и молча расходился с репозиторием).
+# При запуске установщика из клона копируем соседний файл; иначе докачиваем из
+# репозитория. См. BACKLOG MNT-1.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || true)"
-LOCAL_TRANSCRIBE="$SCRIPT_DIR/transcribe.sh"
 
-if [ -n "$SCRIPT_DIR" ] && [ -f "$LOCAL_TRANSCRIBE" ]; then
-    cp "$LOCAL_TRANSCRIBE" "$BIN_DIR/transcribe.sh"
-    echo -e "${GREEN}✓ Скрипт транскрибации установлен (локальная копия)${NC}"
-elif curl -fsSL "$TRANSCRIBE_RAW_URL" -o "$BIN_DIR/transcribe.sh"; then
-    echo -e "${GREEN}✓ Скрипт транскрибации загружен${NC}"
-else
-    echo -e "${RED}✗ Не удалось получить transcribe.sh${NC}"
-    echo -e "${RED}  Нет локальной копии рядом с установщиком и не удалось скачать:${NC}"
-    echo -e "${RED}  $TRANSCRIBE_RAW_URL${NC}"
-    exit 1
-fi
+install_script() {  # $1 — имя файла из scripts/: локальная копия рядом с установщиком или скачивание
+    local name="$1" local_copy="$SCRIPT_DIR/$1" tmp="$BIN_DIR/.$1.new"
+    # Сначала во временный файл, потом mv: bash читает скрипт по ходу исполнения, и если
+    # в этот момент идёт транскрибация (из Finder, минуты), перезапись cp «на месте»
+    # ломает работающий процесс (syntax error посреди слова). mv подменяет только имя —
+    # запущенный экземпляр дочитает старую копию.
+    if [ -n "$SCRIPT_DIR" ] && [ -f "$local_copy" ]; then
+        cp "$local_copy" "$tmp"
+        echo -e "${GREEN}✓ $name установлен (локальная копия)${NC}"
+    elif curl -fsSL "$RAW_SCRIPTS_URL/$name" -o "$tmp"; then
+        echo -e "${GREEN}✓ $name загружен${NC}"
+    else
+        rm -f "$tmp"
+        echo -e "${RED}✗ Не удалось получить $name${NC}"
+        echo -e "${RED}  Нет локальной копии рядом с установщиком и не удалось скачать:${NC}"
+        echo -e "${RED}  $RAW_SCRIPTS_URL/$name${NC}"
+        return 1
+    fi
+    chmod +x "$tmp" && mv -f "$tmp" "$BIN_DIR/$name"
+}
 
-chmod +x "$BIN_DIR/transcribe.sh"
+install_script transcribe.sh || exit 1
+# Раннер GigaAM ставим всегда (он маленький): venv можно доставить позже через WITH_GIGAAM=1.
+install_script gigaam_transcribe.py || echo -e "${YELLOW}⚠ gigaam_transcribe.py не получен — GigaAM будет недоступен${NC}"
+install_script diarize.py || echo -e "${YELLOW}⚠ diarize.py не получен — разметка спикеров будет недоступна${NC}"
 echo -e "${GREEN}✓ Скрипт транскрибации готов${NC}"
+
+# Файл настроек (язык, качество, таймкоды, движки) — шаблон создаётся один раз,
+# при переустановке существующий файл не трогаем.
+if SETTINGS_PATH="$(bash "$BIN_DIR/transcribe.sh" --init-settings 2>/dev/null)"; then
+    echo -e "${GREEN}✓ Файл настроек: $SETTINGS_PATH${NC}"
+fi
 
 # Создание скрипта удаления
 echo "  Создание скрипта удаления..."
@@ -417,6 +579,11 @@ fi
 if [ -d "$WORKFLOW_PATH" ]; then
     echo "  ✓ Quick Action (контекстное меню)"
     echo "    Путь: $WORKFLOW_PATH"
+    echo ""
+fi
+
+if [ -x "$INSTALL_DIR/gigaam/venv/bin/python" ]; then
+    echo "  ✓ GigaAM v3 (Python-окружение и модель — внутри папки приложения)"
     echo ""
 fi
 
@@ -568,6 +735,14 @@ cat > "$WORKFLOW_PATH/Contents/Info.plist" << EOF
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.mok.transcribe.quickaction</string>
+    <key>CFBundleName</key>
+    <string>Транскрибировать</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>ru_RU</string>
     <key>NSServices</key>
     <array>
         <dict>
@@ -601,15 +776,24 @@ cat > "$WORKFLOW_PATH/Contents/Info.plist" << EOF
 </plist>
 EOF
 
-# document.wflow для workflow — полная, проверенная версия (надёжно регистрируется
-# в контекстном меню Finder; минимальный вариант мог не отображаться).
+# document.wflow для workflow — ПОЛНЫЙ документ Automator, а не только массив actions.
+# Finder запускает Службу через строгий WorkflowServiceRunner, который падает с
+# assertion (AMWorkflowServiceRunner.m) на неполном документе — пункт меню виден,
+# но клик молча ничего не делает. Структура сверена с документом, который создаёт
+# сам Automator (macOS 15): AMDocumentVersion, метаданные действия (BundleIdentifier
+# com.apple.RunShellScript, Class Name, уникальные UUID, nibPath) и workflowMetaData
+# с workflowTypeIdentifier = com.apple.Automator.servicesMenu.
+WF_IN_UUID="$(uuidgen)"
+WF_OUT_UUID="$(uuidgen)"
+WF_ACT_UUID="$(uuidgen)"
+
 cat > "$WORKFLOW_PATH/Contents/document.wflow" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>AMApplicationBuild</key>
-    <string>521</string>
+    <string>534</string>
     <key>AMApplicationVersion</key>
     <string>2.10</string>
     <key>AMDocumentVersion</key>
@@ -624,10 +808,10 @@ cat > "$WORKFLOW_PATH/Contents/document.wflow" << EOF
                     <key>Container</key>
                     <string>List</string>
                     <key>Optional</key>
-                    <false/>
+                    <true/>
                     <key>Types</key>
                     <array>
-                        <string>com.apple.cocoa.path</string>
+                        <string>com.apple.cocoa.string</string>
                     </array>
                 </dict>
                 <key>AMActionVersion</key>
@@ -655,7 +839,7 @@ cat > "$WORKFLOW_PATH/Contents/document.wflow" << EOF
                     <string>List</string>
                     <key>Types</key>
                     <array>
-                        <string>com.apple.cocoa.path</string>
+                        <string>com.apple.cocoa.string</string>
                     </array>
                 </dict>
                 <key>ActionBundlePath</key>
@@ -667,7 +851,7 @@ cat > "$WORKFLOW_PATH/Contents/document.wflow" << EOF
                     <key>COMMAND_STRING</key>
                     <string>for f in "\$@"
 do
-    "$HOME/Library/Application Support/Transcribe/bin/transcribe.sh" "\$f"
+    "\$HOME/Library/Application Support/Transcribe/bin/transcribe.sh" "\$f"
 done</string>
                     <key>CheckedForUserDefaultShell</key>
                     <true/>
@@ -693,7 +877,7 @@ done</string>
                 <key>Class Name</key>
                 <string>RunShellScriptAction</string>
                 <key>InputUUID</key>
-                <string>A1B2C3D4-0001-0001-0001-000000000001</string>
+                <string>${WF_IN_UUID}</string>
                 <key>Keywords</key>
                 <array>
                     <string>Shell</string>
@@ -703,9 +887,9 @@ done</string>
                     <string>Unix</string>
                 </array>
                 <key>OutputUUID</key>
-                <string>A1B2C3D4-0002-0002-0002-000000000002</string>
+                <string>${WF_OUT_UUID}</string>
                 <key>UUID</key>
-                <string>A1B2C3D4-0003-0003-0003-000000000003</string>
+                <string>${WF_ACT_UUID}</string>
                 <key>UnlocalizedApplications</key>
                 <array>
                     <string>Automator</string>
@@ -793,11 +977,31 @@ done</string>
     <dict/>
     <key>workflowMetaData</key>
     <dict>
+        <key>applicationBundleIDsByPath</key>
+        <dict/>
+        <key>applicationPaths</key>
+        <array/>
+        <key>inputTypeIdentifier</key>
+        <string>com.apple.Automator.fileSystemObject</string>
+        <key>outputTypeIdentifier</key>
+        <string>com.apple.Automator.nothing</string>
+        <key>presentationMode</key>
+        <integer>11</integer>
+        <key>processesInput</key>
+        <integer>0</integer>
+        <key>serviceApplicationBundleID</key>
+        <string>com.apple.finder</string>
+        <key>serviceApplicationPath</key>
+        <string>/System/Library/CoreServices/Finder.app</string>
         <key>serviceInputTypeIdentifier</key>
         <string>com.apple.Automator.fileSystemObject</string>
         <key>serviceOutputTypeIdentifier</key>
         <string>com.apple.Automator.nothing</string>
         <key>serviceProcessesInput</key>
+        <integer>0</integer>
+        <key>systemImageName</key>
+        <string>NSActionTemplate</string>
+        <key>useAutomaticInputType</key>
         <integer>0</integer>
         <key>workflowTypeIdentifier</key>
         <string>com.apple.Automator.servicesMenu</string>
@@ -824,6 +1028,10 @@ echo "  2. Найдите любой видео или аудио файл (.mov
 echo "  3. Кликните правой кнопкой мыши → Quick Actions → Транскрибировать"
 echo "  4. Дождитесь уведомления о завершении"
 echo "  5. Текстовый файл появится рядом с исходным файлом"
+if [ "$GIGAAM_STATUS" = "ok" ]; then
+    echo "     Файлов будет два: <имя>.whisper.txt и <имя>.gigaam.txt (GigaAM v3) —"
+    echo "     одна запись, два независимых распознавания. Только Whisper: ENGINE=whisper"
+fi
 echo ""
 echo -e "${YELLOW}💡 Совет:${NC} Первая транскрибация может занять больше времени"
 echo -e "${YELLOW}   из-за инициализации модели.${NC}"
@@ -831,6 +1039,8 @@ echo ""
 echo -e "${BLUE}Установлено в:${NC}"
 echo "  • Приложение: $INSTALL_DIR"
 echo "  • Quick Action: $SERVICES_DIR/Транскрибировать.workflow"
+echo "  • Настройки: $INSTALL_DIR/settings.txt (язык, качество, таймкоды, движки —"
+echo "    действуют и для правого клика в Finder; откройте в TextEdit)"
 echo ""
 echo -e "${YELLOW}🗑️  Для удаления запустите:${NC}"
 echo "  bash \"$BIN_DIR/uninstall.sh\""
